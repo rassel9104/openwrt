@@ -1,0 +1,218 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+WORK_DIR='/tmp/nano-monitor'
+LOCK_DIR="$WORK_DIR/lock"
+PID_FILE="$WORK_DIR/pid"
+HELPER='/usr/libexec/nano-monitor/run-speedtest'
+
+json_error() {
+	json_init
+	json_add_string ok '0'
+	json_add_string error "$1"
+	json_dump
+	json_cleanup
+}
+
+validate_input() {
+	local input keys key
+	input="$(cat)"
+	json_load "$input" 2>/dev/null || {
+		json_error 'Solicitud JSON no válida.'
+		return 1
+	}
+	json_get_keys keys
+	for key in $keys; do
+		[ "$key" = 'ubus_rpc_session' ] || {
+			json_error "Argumento no permitido: $key"
+			json_cleanup
+			return 1
+		}
+	done
+	json_cleanup
+	return 0
+}
+
+valid_uint_range() {
+	local value="$1" minimum="$2" maximum="$3"
+	case "$value" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$value" -ge "$minimum" ] 2>/dev/null && [ "$value" -le "$maximum" ] 2>/dev/null
+}
+
+valid_server() {
+	local server="$1" old_ifs label
+	[ -n "$server" ] && [ "${#server}" -le 253 ] || return 1
+	case "$server" in
+		-*|.*|*.|*..*) return 1 ;;
+	esac
+
+	case "$server" in
+		*:*)
+			case "$server" in *[!0-9A-Fa-f:.]*) return 1 ;; esac
+			;;
+		*)
+			case "$server" in *[!A-Za-z0-9.-]*) return 1 ;; esac
+			old_ifs="$IFS"
+			IFS='.'
+			set -- $server
+			IFS="$old_ifs"
+			for label in "$@"; do
+				[ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+				case "$label" in -*|*-) return 1 ;; esac
+			done
+			;;
+	esac
+	return 0
+}
+
+read_value() {
+	local file="$1" default="$2" value
+	if [ -f "$WORK_DIR/$file" ]; then
+		value="$(cat "$WORK_DIR/$file" 2>/dev/null)"
+		printf '%s' "$value"
+	else
+		printf '%s' "$default"
+	fi
+}
+
+method_status() {
+	local server port duration streams state pid
+	config_load nano-monitor
+	config_get server main server ''
+	config_get port main port '5201'
+	config_get duration main duration '10'
+	config_get streams main streams '1'
+	state="$(read_value state idle)"
+	pid="$(read_value pid '')"
+
+	json_init
+	json_add_string configured "$([ -n "$server" ] && printf 1 || printf 0)"
+	json_add_string server "$server"
+	json_add_string port "$port"
+	json_add_string duration "$duration"
+	json_add_string streams "$streams"
+	json_add_string state "$state"
+	json_add_string pid "$pid"
+	json_add_string message "$(read_value message '')"
+	json_add_string latency_ms "$(read_value latency_ms '')"
+	json_add_string download_json "$(read_value download.json '')"
+	json_add_string upload_json "$(read_value upload.json '')"
+	json_add_string download_error "$(read_value download.error '')"
+	json_add_string upload_error "$(read_value upload.error '')"
+	json_dump
+	json_cleanup
+}
+
+method_start() {
+	local server port duration streams pid
+	config_load nano-monitor
+	config_get server main server ''
+	config_get port main port '5201'
+	config_get duration main duration '10'
+	config_get streams main streams '1'
+
+	valid_server "$server" || {
+		json_error 'Configura un servidor VPS con hostname, IPv4 o IPv6 válido.'
+		return
+	}
+	valid_uint_range "$port" 1 65535 || {
+		json_error 'El puerto debe estar entre 1 y 65535.'
+		return
+	}
+	valid_uint_range "$duration" 1 30 || {
+		json_error 'La duración debe estar entre 1 y 30 segundos.'
+		return
+	}
+	valid_uint_range "$streams" 1 2 || {
+		json_error 'Los flujos deben estar entre 1 y 2.'
+		return
+	}
+
+	mkdir -p "$WORK_DIR" || {
+		json_error 'No se pudo crear el directorio temporal.'
+		return
+	}
+
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		pid="$(cat "$PID_FILE" 2>/dev/null)"
+		case "$pid" in
+			''|*[!0-9]*) ;;
+			*)
+				if [ "$pid" -gt 1 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+					json_error 'Ya hay una prueba en curso.'
+					return
+				fi
+				;;
+		esac
+		rm -f "$PID_FILE"
+		rmdir "$LOCK_DIR" 2>/dev/null
+		mkdir "$LOCK_DIR" 2>/dev/null || {
+			json_error 'Ya hay una prueba en curso.'
+			return
+		}
+	fi
+
+	printf '%s\n' 'queued' > "$WORK_DIR/state"
+	printf '%s\n' 'Prueba en cola…' > "$WORK_DIR/message"
+	"$HELPER" "$server" "$port" "$duration" "$streams" >/dev/null 2>&1 &
+	pid=$!
+	printf '%s\n' "$pid" > "$PID_FILE"
+
+	json_init
+	json_add_string ok '1'
+	json_add_string state 'queued'
+	json_add_string pid "$pid"
+	json_dump
+	json_cleanup
+}
+
+method_devices() {
+	local nlbw_data nlbw_error leases rc
+	nlbw_data="$(nlbw -c json -g ip,mac -o -rx_bytes 2>/dev/null)"
+	rc=$?
+	[ "$rc" -eq 0 ] || nlbw_error='nlbwmon todavía no ofrece datos.'
+	[ -r /tmp/dhcp.leases ] && leases="$(cat /tmp/dhcp.leases 2>/dev/null)"
+
+	json_init
+	json_add_string nlbw "$nlbw_data"
+	json_add_string leases "$leases"
+	json_add_string error "$nlbw_error"
+	json_dump
+	json_cleanup
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object status
+		json_close_object
+		json_add_object start
+		json_close_object
+		json_add_object devices
+		json_close_object
+		json_dump
+		json_cleanup
+		;;
+	call)
+		case "$2" in
+			status|start|devices)
+				validate_input || exit 1
+				"method_$2"
+				;;
+			*)
+				json_error 'Método no permitido.'
+				exit 1
+				;;
+		esac
+		;;
+	*)
+		json_error 'Operación RPC no permitida.'
+		exit 1
+		;;
+esac

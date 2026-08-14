@@ -11,6 +11,36 @@ full customization, to use the device in ways never envisioned.
 
 Sunshine!
 
+## NanoStation M XW build
+
+This tree contains a firmware profile for the Ubiquiti NanoStation M XW based on
+OpenWrt 24.10.5. It extends the ath9k upper 5 GHz channel table and includes the
+lightweight `luci-app-nano-monitor` package.
+
+The monitor provides:
+
+* on-demand download and upload tests from the Nano against a configurable
+  iperf3 server;
+* per-device current rate and accumulated usage using nlbwmon;
+* the existing `bwlimit` service and its current configuration;
+* a compact LuCI interface without Chart.js, Python, Go or legacy Lua runtime.
+
+To reproduce the selected profile:
+
+```sh
+cp nano-m5.config .config
+make defconfig
+make -j"$(nproc)"
+```
+
+If the host `PATH` contains Windows entries with spaces, use a sanitized build
+path because GNU find rejects unsafe relative entries during package indexing:
+
+```sh
+env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  make -j"$(nproc)"
+```
+
 ## Download
 
 Built firmware images are available for many architectures and come with a

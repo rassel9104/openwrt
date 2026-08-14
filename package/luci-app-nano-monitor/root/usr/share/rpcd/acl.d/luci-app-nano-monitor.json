@@ -1,0 +1,17 @@
+{
+	"luci-app-nano-monitor": {
+		"description": "Administrar el monitor de red del Nano",
+		"read": {
+			"ubus": {
+				"luci.nano-monitor": [ "status", "devices" ]
+			},
+			"uci": [ "nano-monitor", "bwlimit" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.nano-monitor": [ "start" ]
+			},
+			"uci": [ "nano-monitor" ]
+		}
+	}
+}

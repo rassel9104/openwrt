@@ -1,0 +1,85 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+WORK_DIR='/tmp/nano-monitor'
+LOCK_DIR="$WORK_DIR/lock"
+PID_FILE="$WORK_DIR/pid"
+
+server="$1"
+port="$2"
+duration="$3"
+streams="$4"
+
+write_state() {
+	printf '%s\n' "$1" > "$WORK_DIR/state.tmp"
+	mv "$WORK_DIR/state.tmp" "$WORK_DIR/state"
+	printf '%s\n' "$2" > "$WORK_DIR/message.tmp"
+	mv "$WORK_DIR/message.tmp" "$WORK_DIR/message"
+}
+
+cleanup() {
+	rm -f "$PID_FILE" "$WORK_DIR/state.tmp" "$WORK_DIR/message.tmp"
+	rmdir "$LOCK_DIR" 2>/dev/null
+}
+
+abort_test() {
+	write_state 'error' 'La prueba fue interrumpida.'
+	exit 1
+}
+
+run_iperf() {
+	local direction="$1" output="$2" error="$3" limit reverse
+	limit=$((duration + 15))
+	[ "$direction" = 'download' ] && reverse='-R'
+
+	if command -v timeout >/dev/null 2>&1; then
+		timeout -s TERM "$limit" iperf3 -c "$server" -p "$port" -t "$duration" -P "$streams" --connect-timeout 5000 -J $reverse > "$output.tmp" 2> "$error.tmp"
+	else
+		iperf3 -c "$server" -p "$port" -t "$duration" -P "$streams" --connect-timeout 5000 -J $reverse > "$output.tmp" 2> "$error.tmp"
+	fi
+	local rc=$?
+	mv "$output.tmp" "$output"
+	mv "$error.tmp" "$error"
+	return "$rc"
+}
+
+case "$server" in
+	''|-*|*[!A-Za-z0-9.:-]*) exit 2 ;;
+esac
+case "$port:$duration:$streams" in
+	*[!0-9:]*) exit 2 ;;
+esac
+[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || exit 2
+[ "$duration" -ge 1 ] 2>/dev/null && [ "$duration" -le 30 ] 2>/dev/null || exit 2
+[ "$streams" -ge 1 ] 2>/dev/null && [ "$streams" -le 2 ] 2>/dev/null || exit 2
+
+mkdir -p "$WORK_DIR" || exit 1
+trap cleanup EXIT
+trap abort_test HUP INT TERM
+
+rm -f "$WORK_DIR/download.json" "$WORK_DIR/upload.json" \
+	"$WORK_DIR/download.error" "$WORK_DIR/upload.error" "$WORK_DIR/latency_ms"
+
+write_state 'ping' 'Midiendo latencia…'
+ping_output="$(ping -c 2 -W 2 "$server" 2>/dev/null)"
+latency="$(printf '%s\n' "$ping_output" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')"
+[ -n "$latency" ] && printf '%s\n' "$latency" > "$WORK_DIR/latency_ms"
+
+write_state 'download' 'Midiendo descarga…'
+download_ok=0
+run_iperf download "$WORK_DIR/download.json" "$WORK_DIR/download.error" && download_ok=1
+
+write_state 'upload' 'Midiendo subida…'
+upload_ok=0
+run_iperf upload "$WORK_DIR/upload.json" "$WORK_DIR/upload.error" && upload_ok=1
+
+if [ "$download_ok" -eq 1 ] && [ "$upload_ok" -eq 1 ]; then
+	write_state 'done' 'Prueba completada.'
+elif [ "$download_ok" -eq 1 ] || [ "$upload_ok" -eq 1 ]; then
+	write_state 'partial' 'Prueba parcial: una dirección no pudo completarse.'
+else
+	write_state 'error' 'No se pudo completar la prueba contra el VPS.'
+fi
+
+exit 0

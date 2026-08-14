@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+# Las configuraciones nano-monitor y bwlimit son conffiles: no se reescriben aquí.
+if uci -q get nlbwmon.@nlbwmon[0] >/dev/null; then
+	uci -q set nlbwmon.@nlbwmon[0].netlink_buffer_size='131072'
+	uci -q set nlbwmon.@nlbwmon[0].refresh_interval='10s'
+	uci -q set nlbwmon.@nlbwmon[0].commit_interval='24h'
+	uci -q set nlbwmon.@nlbwmon[0].database_generations='2'
+	uci -q set nlbwmon.@nlbwmon[0].database_limit='1000'
+	uci -q set nlbwmon.@nlbwmon[0].database_compress='1'
+	uci -q set nlbwmon.@nlbwmon[0].protocol_database='/dev/null'
+	uci -q commit nlbwmon
+fi
+
+/etc/init.d/nlbwmon enable >/dev/null 2>&1
+if [ "$(uci -q get bwlimit.main.enabled)" = '1' ]; then
+	/etc/init.d/bwlimit enable >/dev/null 2>&1
+else
+	/etc/init.d/bwlimit disable >/dev/null 2>&1
+fi
+
+exit 0
