@@ -1,0 +1,26 @@
+--- a/drivers/net/wireless/ath/ath9k/hw.h
++++ b/drivers/net/wireless/ath/ath9k/hw.h
+@@ -74,7 +74,7 @@
+ #define ATH9K_HW_CAP_EDMA             BIT(20)
+ #define ATH9K_HW_CAP_FASTCLOCK        BIT(21)
+ 
+-#define ATH9K_NUM_CHANNELS	38
++#define ATH9K_NUM_CHANNELS	44
+ 
+ /* Register read/write primitives */
+ #define ENABLE_REGWRITE_BUFFER(_ah) do {\
+--- a/drivers/net/wireless/ath/ath9k/common-init.c
++++ b/drivers/net/wireless/ath/ath9k/common-init.c
+@@ -90,6 +90,12 @@ static const struct ieee80211_channel at
+ 	CHAN5G(5785, 35), /* Channel 157 */
+ 	CHAN5G(5805, 36), /* Channel 161 */
+ 	CHAN5G(5825, 37), /* Channel 165 */
++	CHAN5G(5835, 38), /* Channel 167 */
++	CHAN5G(5845, 39), /* Channel 169 */
++	CHAN5G(5855, 40), /* Channel 171 */
++	CHAN5G(5865, 41), /* Channel 173 */
++	CHAN5G(5875, 42), /* Channel 175 */
++	CHAN5G(5885, 43), /* Channel 177 */
+ };
+ 
+ /* Atheros hardware rate code addition for short preamble */

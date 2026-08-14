@@ -1,0 +1,17 @@
+Extend world regdomain upper 5 GHz block to keep one reusable image for
+links that may move across nearby high channels.
+
+This keeps NO-IR to avoid turning this into an unrestricted AP policy patch,
+while still widening channel availability for passive/STA usage.
+
+--- a/db.txt
++++ b/db.txt
+@@ -26,7 +26,7 @@ country 00:
+ 	# Channel 100 - 144
+ 	(5490 - 5730 @ 160), (20), NO-IR, DFS
+ 	# Channel 149 - 165
+-	(5735 - 5835 @ 80), (20), NO-IR
++	(5735 - 5895 @ 80), (20), NO-IR, AUTO-BW
+ 	# IEEE 802.11ad (60GHz), channels 1..3
+ 	(57240 - 63720 @ 2160), (0)
+ 
