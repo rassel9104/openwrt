@@ -1,5 +1,2 @@
 config nano-monitor 'main'
-	option server ''
-	option port '5201'
-	option duration '10'
-	option streams '1'
+	option profile 'balanced'

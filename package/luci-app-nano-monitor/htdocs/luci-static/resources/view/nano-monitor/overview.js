@@ -55,21 +55,19 @@ function formatBytes(bytes) {
 	return value.toFixed(index === 0 ? 0 : 1) + ' ' + units[index];
 }
 
-function parseIperf(raw, direction) {
+function parseMeasurement(raw) {
 	if (!raw)
 		return null;
 	try {
-		var data = JSON.parse(raw), end = data.end || {}, summary;
-		summary = end.sum_received;
-		summary = summary || end.sum || {};
+		var data = JSON.parse(raw);
 		return {
-			bits: Number(summary.bits_per_second),
-			cpu: Number((end.cpu_utilization_percent || {}).host_total),
-			error: data.error || ''
+			bits: Number(data.bits_per_second),
+			cpu: Number(data.cpu),
+			error: ''
 		};
 	}
 	catch (e) {
-		return { bits: NaN, cpu: NaN, error: 'Respuesta iperf3 no válida' };
+		return { bits: NaN, cpu: NaN, error: 'Resultado de medición no válido' };
 	}
 }
 
@@ -79,12 +77,12 @@ function renderStatus(status) {
 		download: 'Descarga', upload: 'Subida', done: 'Completada',
 		partial: 'Parcial', error: 'Error'
 	};
-	var down = parseIperf(status.download_json, 'download');
-	var up = parseIperf(status.upload_json, 'upload');
+	var down = parseMeasurement(status.download_json);
+	var up = parseMeasurement(status.upload_json);
 	var busy = [ 'queued', 'ping', 'download', 'upload' ].indexOf(status.state) !== -1;
 
 	setText('nm-state', stateNames[status.state] || status.state || 'Desconocido');
-	setText('nm-message', status.configured === '1' ? (status.message || 'Listo para medir.') : 'Configura primero el servidor iperf3 del VPS.');
+	setText('nm-message', status.message || 'Listo para medir contra Cloudflare.');
 	setText('nm-download', down ? formatRate(down.bits) : '—');
 	setText('nm-upload', up ? formatRate(up.bits) : '—');
 	setText('nm-latency', status.latency_ms ? status.latency_ms + ' ms' : 'No disponible');
@@ -194,38 +192,20 @@ return view.extend({
 	},
 
 	render: function(initial) {
-		var map = new form.Map('nano-monitor', 'Monitor Nano', 'Prueba real contra tu VPS y consumo acumulado de la red local. Los resultados de velocidad solo viven en /tmp.');
-		var section = map.section(form.NamedSection, 'main', 'nano-monitor', 'Servidor iperf3');
+		var map = new form.Map('nano-monitor', 'Monitor Nano', 'Prueba pública iniciada por el propio Nano y consumo acumulado de la red local. Los resultados de velocidad son temporales y desaparecen al reiniciar.');
+		var section = map.section(form.NamedSection, 'main', 'nano-monitor', 'Medición pública');
 		var option;
 
-		option = section.option(form.Value, 'server', 'Servidor VPS');
-		option.placeholder = 'iperf.ejemplo.net';
-		option.rmempty = true;
-		option.validate = function(sectionId, value) {
-			if (!value)
-				return true;
-			if (value.length > 253 || /^[-.]|\.$|\.\.|[^A-Za-z0-9.:-]/.test(value))
-				return 'Introduce un hostname, IPv4 o IPv6 válido.';
-			return true;
-		};
-
-		option = section.option(form.Value, 'port', 'Puerto');
-		option.datatype = 'port';
-		option.default = '5201';
+		option = section.option(form.ListValue, 'profile', 'Precisión');
+		option.value('quick', 'Rápida · 2 MB ↓ / 1 MB ↑');
+		option.value('balanced', 'Equilibrada · 5 MB ↓ / 2 MB ↑');
+		option.value('accurate', 'Alta · 10 MB ↓ / 4 MB ↑');
+		option.default = 'balanced';
 		option.rmempty = false;
-
-		option = section.option(form.Value, 'duration', 'Duración (s)');
-		option.datatype = 'range(1,30)';
-		option.default = '10';
-		option.rmempty = false;
-
-		option = section.option(form.ListValue, 'streams', 'Flujos paralelos');
-		option.value('1', '1 (recomendado)');
-		option.value('2', '2');
-		option.default = '1';
+		option.description = 'Cloudflare selecciona automáticamente un punto de presencia cercano. Una prueba mayor reduce el efecto de la latencia inicial, pero consume más datos.';
 
 		option = section.option(form.Button, '_start', 'Prueba de velocidad');
-		option.inputtitle = 'Guardar e iniciar prueba';
+		option.inputtitle = 'Iniciar prueba pública';
 		option.inputstyle = 'apply';
 		option.onclick = function(ev) {
 			var button = ev && ev.currentTarget;
@@ -234,7 +214,7 @@ return view.extend({
 			return this.map.save().then(callStart).then(function(result) {
 				if (result.ok !== '1')
 					throw new Error(result.error || 'No se pudo iniciar la prueba.');
-				renderStatus({ state: 'queued', configured: '1', message: 'Prueba en cola…' });
+				renderStatus({ state: 'queued', message: 'Prueba en cola…' });
 				ui.addNotification(null, E('p', {}, 'Prueba iniciada; descarga y subida se ejecutarán de forma secuencial.'), 'info');
 			}).catch(function(error) {
 				ui.addNotification(null, E('p', {}, error.message), 'error');
@@ -257,7 +237,7 @@ return view.extend({
 					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Estado'), E('div', { 'id': 'nm-state', 'class': 'nm-value nm-state', 'aria-live': 'polite' }, '—'), E('small', { 'id': 'nm-message' }, '') ]),
 					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Descarga'), E('div', { 'id': 'nm-download', 'class': 'nm-value' }, '—') ]),
 					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Subida'), E('div', { 'id': 'nm-upload', 'class': 'nm-value' }, '—') ]),
-					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Latencia · CPU cliente'), E('div', { 'id': 'nm-latency', 'class': 'nm-value' }, '—'), E('small', { 'id': 'nm-cpu' }, '—') ])
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Latencia · CPU del Nano'), E('div', { 'id': 'nm-latency', 'class': 'nm-value' }, '—'), E('small', { 'id': 'nm-cpu' }, '—') ])
 				]),
 				E('p', { 'id': 'nm-errors', 'class': 'nm-errors', 'role': 'status' }, '')
 			]),

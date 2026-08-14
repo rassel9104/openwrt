@@ -19,8 +19,8 @@ lightweight `luci-app-nano-monitor` package.
 
 The monitor provides:
 
-* on-demand download and upload tests from the Nano against a configurable
-  iperf3 server;
+* on-demand download and upload tests from the Nano against Cloudflare's public
+  speed endpoints;
 * per-device current rate and accumulated usage using nlbwmon;
 * the existing `bwlimit` service and its current configuration;
 * a compact LuCI interface without Chart.js, Python, Go or legacy Lua runtime.

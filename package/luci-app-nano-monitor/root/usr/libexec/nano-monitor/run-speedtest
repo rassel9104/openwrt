@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
-WORK_DIR='/tmp/nano-monitor'
+WORK_DIR='/var/run/nano-monitor'
 LOCK_DIR="$WORK_DIR/lock"
 PID_FILE="$WORK_DIR/pid"
 
-server="$1"
-port="$2"
-duration="$3"
-streams="$4"
+profile="$1"
+download_url='https://speed.cloudflare.com/__down'
+upload_url='https://speed.cloudflare.com/__up'
+upload_file="$WORK_DIR/upload.bin"
 
 write_state() {
 	printf '%s\n' "$1" > "$WORK_DIR/state.tmp"
@@ -19,7 +19,7 @@ write_state() {
 }
 
 cleanup() {
-	rm -f "$PID_FILE" "$WORK_DIR/state.tmp" "$WORK_DIR/message.tmp"
+	rm -f "$PID_FILE" "$WORK_DIR/state.tmp" "$WORK_DIR/message.tmp" "$upload_file"
 	rmdir "$LOCK_DIR" 2>/dev/null
 }
 
@@ -28,33 +28,88 @@ abort_test() {
 	exit 1
 }
 
-run_iperf() {
-	local direction="$1" output="$2" error="$3" limit reverse
-	limit=$((duration + 15))
-	[ "$direction" = 'download' ] && reverse='-R'
-
-	if command -v timeout >/dev/null 2>&1; then
-		timeout -s TERM "$limit" iperf3 -c "$server" -p "$port" -t "$duration" -P "$streams" --connect-timeout 5000 -J $reverse > "$output.tmp" 2> "$error.tmp"
+prepare_work_dir() {
+	[ ! -L "$WORK_DIR" ] || return 1
+	if [ -e "$WORK_DIR" ]; then
+		[ -d "$WORK_DIR" ] || return 1
 	else
-		iperf3 -c "$server" -p "$port" -t "$duration" -P "$streams" --connect-timeout 5000 -J $reverse > "$output.tmp" 2> "$error.tmp"
+		mkdir -m 0700 "$WORK_DIR" || return 1
 	fi
-	local rc=$?
-	mv "$output.tmp" "$output"
-	mv "$error.tmp" "$error"
-	return "$rc"
+	chmod 0700 "$WORK_DIR"
 }
 
-case "$server" in
-	''|-*|*[!A-Za-z0-9.:-]*) exit 2 ;;
-esac
-case "$port:$duration:$streams" in
-	*[!0-9:]*) exit 2 ;;
-esac
-[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || exit 2
-[ "$duration" -ge 1 ] 2>/dev/null && [ "$duration" -le 30 ] 2>/dev/null || exit 2
-[ "$streams" -ge 1 ] 2>/dev/null && [ "$streams" -le 2 ] 2>/dev/null || exit 2
+cpu_sample() {
+	awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total += $i; printf "%.0f %.0f\n", total, $5 + $6; exit }' /proc/stat
+}
 
-mkdir -p "$WORK_DIR" || exit 1
+write_result() {
+	local output="$1" bytes="$2" elapsed="$3" total_before="$4" idle_before="$5" total_after="$6" idle_after="$7"
+	awk -v bytes="$bytes" -v elapsed="$elapsed" -v tb="$total_before" -v ib="$idle_before" -v ta="$total_after" -v ia="$idle_after" '
+		BEGIN {
+			if (elapsed < 1) elapsed = 1;
+			dt = ta - tb; di = ia - ib;
+			cpu = (dt > 0) ? 100 * (dt - di) / dt : 0;
+			bps = bytes * 8000 / elapsed;
+			printf "{\"bytes\":%.0f,\"elapsed_ms\":%.0f,\"bits_per_second\":%.0f,\"cpu\":%.1f}\n", bytes, elapsed, bps, cpu;
+		}' > "$output.tmp"
+	mv "$output.tmp" "$output"
+}
+
+run_download() {
+	local output="$WORK_DIR/download.json" error="$WORK_DIR/download.error"
+	local metrics measured_bytes elapsed_us elapsed_ms before_total before_idle after_total after_idle rc
+	set -- $(cpu_sample); before_total="$1"; before_idle="$2"
+	metrics="$(nano-http-transfer get "${download_url}?bytes=${download_bytes}" 2> "$error.tmp")"
+	rc=$?
+	set -- $(cpu_sample); after_total="$1"; after_idle="$2"
+	mv "$error.tmp" "$error"
+	[ "$rc" -eq 0 ] || return "$rc"
+	set -- $metrics
+	[ "$#" -eq 2 ] || return 1
+	case "$1:$2" in *[!0-9:]*) return 1 ;; esac
+	measured_bytes="$1"; elapsed_us="$2"; elapsed_ms=$(((elapsed_us + 500) / 1000))
+	write_result "$output" "$measured_bytes" "$elapsed_ms" "$before_total" "$before_idle" "$after_total" "$after_idle"
+}
+
+run_upload() {
+	local output="$WORK_DIR/upload.json" error="$WORK_DIR/upload.error"
+	local metrics measured_bytes elapsed_us elapsed_ms before_total before_idle after_total after_idle count rc
+	count=$((upload_bytes / 1024))
+	if ! dd if=/dev/zero of="$upload_file" bs=1024 count="$count" 2>/dev/null; then
+		printf '%s\n' 'No se pudo preparar la carga temporal.' > "$error"
+		return 1
+	fi
+	: > "$error.tmp"
+	set -- $(cpu_sample); before_total="$1"; before_idle="$2"
+	metrics="$(nano-http-transfer post "$upload_url" "$upload_file" 2>> "$error.tmp")"
+	rc=$?
+	set -- $(cpu_sample); after_total="$1"; after_idle="$2"
+	mv "$error.tmp" "$error"
+	[ "$rc" -eq 0 ] || return "$rc"
+	set -- $metrics
+	[ "$#" -eq 2 ] || return 1
+	case "$1:$2" in *[!0-9:]*) return 1 ;; esac
+	measured_bytes="$1"; elapsed_us="$2"; elapsed_ms=$(((elapsed_us + 500) / 1000))
+	write_result "$output" "$measured_bytes" "$elapsed_ms" "$before_total" "$before_idle" "$after_total" "$after_idle"
+}
+
+case "$profile" in
+	quick)
+		download_bytes=2000000
+		upload_bytes=1000000
+		;;
+	balanced)
+		download_bytes=5000000
+		upload_bytes=2000000
+		;;
+	accurate)
+		download_bytes=10000000
+		upload_bytes=4000000
+		;;
+	*) exit 2 ;;
+esac
+
+prepare_work_dir || exit 1
 trap cleanup EXIT
 trap abort_test HUP INT TERM
 
@@ -62,24 +117,24 @@ rm -f "$WORK_DIR/download.json" "$WORK_DIR/upload.json" \
 	"$WORK_DIR/download.error" "$WORK_DIR/upload.error" "$WORK_DIR/latency_ms"
 
 write_state 'ping' 'Midiendo latencia…'
-ping_output="$(ping -c 2 -W 2 "$server" 2>/dev/null)"
+ping_output="$(ping -4 -c 3 -W 2 speed.cloudflare.com 2>/dev/null)"
 latency="$(printf '%s\n' "$ping_output" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')"
 [ -n "$latency" ] && printf '%s\n' "$latency" > "$WORK_DIR/latency_ms"
 
 write_state 'download' 'Midiendo descarga…'
 download_ok=0
-run_iperf download "$WORK_DIR/download.json" "$WORK_DIR/download.error" && download_ok=1
+run_download && download_ok=1
 
 write_state 'upload' 'Midiendo subida…'
 upload_ok=0
-run_iperf upload "$WORK_DIR/upload.json" "$WORK_DIR/upload.error" && upload_ok=1
+run_upload && upload_ok=1
 
 if [ "$download_ok" -eq 1 ] && [ "$upload_ok" -eq 1 ]; then
 	write_state 'done' 'Prueba completada.'
 elif [ "$download_ok" -eq 1 ] || [ "$upload_ok" -eq 1 ]; then
 	write_state 'partial' 'Prueba parcial: una dirección no pudo completarse.'
 else
-	write_state 'error' 'No se pudo completar la prueba contra el VPS.'
+	write_state 'error' 'No se pudo completar la prueba contra Cloudflare.'
 fi
 
 exit 0
