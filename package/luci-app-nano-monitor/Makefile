@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_LICENSE:=MIT
 PKG_VERSION:=1.4.0
-PKG_RELEASE:=14
+PKG_RELEASE:=18
 
 LUCI_TITLE:=Monitor ligero de red para NanoStation M5
 LUCI_DESCRIPTION:=Pruebas HTTP públicas, cuotas WAN individuales y límites prioritarios para NanoStation M5

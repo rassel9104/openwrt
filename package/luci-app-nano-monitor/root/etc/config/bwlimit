@@ -1,6 +1,7 @@
 config bwlimit 'main'
 	option enabled '1'
-	option schema_version '4'
+	option schema_version '5'
+	option accounting_checkpoint_model 'exact-v1'
 	option lan_if 'br-lan'
 	option wan_network 'provider'
 	option subnet '192.168.1.0/24'

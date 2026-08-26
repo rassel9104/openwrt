@@ -46,7 +46,7 @@ stop_service() {
 	if nft list table inet nano_accounting >/dev/null 2>&1; then
 		nft list table inet nano_accounting 2>/dev/null | grep -Fq 'comment "nano-monitor-accounting-v1"' || return 1
 		# No daemon can persist the final delta. Mark the session unclean before
-		# deletion so the next start consumes the reserved recovery allowance.
+		# deletion; the next start restores the last exact durable checkpoint.
 		mark_orphan_dirty || return 1
 		nft delete table inet nano_accounting >/dev/null 2>&1 || return 1
 		nft list table inet nano_accounting >/dev/null 2>&1 && return 1

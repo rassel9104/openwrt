@@ -7,6 +7,7 @@ STOP=10
 USE_PROCD=1
 
 STATE_DIR='/var/run/nano-shaper'
+DEVICES_FILE="$STATE_DIR/devices"
 GENERATION_FILE="$STATE_DIR/generation"
 PUBLICATION_LOCK="$STATE_DIR/state.lock"
 TABLE_FAMILY='inet'
@@ -14,6 +15,7 @@ TABLE_NAME='nano_shaper'
 GATE_TABLE='nano_shaper_gate'
 ACCOUNT_TABLE='nano_accounting'
 REGISTRY='/usr/libexec/nano-monitor/device-registry'
+. /usr/libexec/nano-monitor/device-policy
 OWNER_COMMENT='nano-monitor-owned-v1'
 OWNER_CLASS=4095
 BASE_RATE_KBIT=1
@@ -80,7 +82,7 @@ collect_reservation() {
 }
 
 load_settings() {
-	local status value tab id mac ip name reserved
+	local status value tab id mac ip name reserved period_day registry tmp="$DEVICES_FILE.tmp"
 	config_load bwlimit
 	config_get_bool enabled main enabled 0
 	config_get lan_if main lan_if 'br-lan'
@@ -90,6 +92,7 @@ load_settings() {
 	config_get other_down_kbit main other_down_kbit '768'
 	config_get other_up_kbit main other_up_kbit '128'
 	config_get degraded_kbit main other_degraded_kbit '64'
+	config_get quota_bytes main quota_per_device_bytes '700000000'
 	PRIORITY_IPS=''; PRIORITY_SET=''
 	config_list_foreach main exempt_ip add_priority_ip
 	[ -n "$PRIORITY_IPS" ] || return 1
@@ -97,7 +100,7 @@ load_settings() {
 	wan_if="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	valid_iface "$lan_if" && valid_iface "$wan_if" || return 1
 	[ -d "/sys/class/net/$lan_if" ] && [ -d "/sys/class/net/$wan_if" ] || return 1
-	for value in "$total_down_kbit" "$total_up_kbit" "$other_down_kbit" "$other_up_kbit" "$degraded_kbit"; do is_uint "$value" || return 1; done
+	for value in "$total_down_kbit" "$total_up_kbit" "$other_down_kbit" "$other_up_kbit" "$degraded_kbit" "$quota_bytes"; do is_uint "$value" || return 1; done
 	[ "$total_down_kbit" -ge 512 ] && [ "$total_up_kbit" -ge 256 ] || return 1
 	[ "$degraded_kbit" -ge 32 ] || return 1
 	[ "$other_down_kbit" -ge "$degraded_kbit" ] && [ "$other_down_kbit" -lt "$total_down_kbit" ] || return 1
@@ -107,17 +110,30 @@ load_settings() {
 	config_foreach collect_reservation host
 	for ip in $PRIORITY_IPS; do case "$RESERVED_IPS" in *" $ip "*) ;; *) return 1 ;; esac; done
 	[ -x "$REGISTRY" ] || return 1
+	# Accounting starts one init slot earlier, but procd may not have published its
+	# volatile snapshot yet. Speeds are day-independent, so use the durable period
+	# (then the formatted wall date) only during that narrow boot convergence.
+	period_day="$(sed -n 's/^day=//p' /var/run/nano-accounting/current-snapshot 2>/dev/null | sed -n '1p')"
+	case "$period_day" in ????-??-??) ;; *) period_day="$(sed -n 's/^day=//p' /etc/nano-monitor/daily-state 2>/dev/null | sed -n '1p')" ;; esac
+	case "$period_day" in ????-??-??) ;; *) period_day="$(date +%F)" ;; esac
+	case "$period_day" in ????-??-??) ;; *) return 1 ;; esac
+	[ ! -L "$DEVICES_FILE" ] || return 1
+	: > "$tmp" || return 1
+	registry="$($REGISTRY)" || { rm -f "$tmp"; return 1; }
 	OTHER_IPS=''; other_count=0
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip name; do
 		[ -z "$id" ] && continue
-		valid_ipv4 "$ip" || return 1
+		valid_ipv4 "$ip" || { rm -f "$tmp"; return 1; }
+		load_device_policy "$id" "$mac" "$period_day" "$quota_bytes" "$other_down_kbit" "$other_up_kbit" "$total_down_kbit" "$total_up_kbit" "$degraded_kbit" || { rm -f "$tmp"; return 1; }
+		printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$POLICY_DOWN_KBIT" "$POLICY_UP_KBIT" >> "$tmp" || { rm -f "$tmp"; return 1; }
 		OTHER_IPS="${OTHER_IPS}${OTHER_IPS:+ }$ip"
 		other_count=$((other_count + 1))
+		[ "$other_count" -le "$MAX_DEVICES" ] || { rm -f "$tmp"; return 1; }
 	done <<EOF
-$($REGISTRY)
+$registry
 EOF
-	[ "$other_count" -le "$MAX_DEVICES" ] || return 1
+	mv "$tmp" "$DEVICES_FILE" || return 1
 	# HTB "rate" reserves bandwidth even when a class is idle. Reserve only a
 	# token 1 Kbit/s per leaf; the configured values are strict ceilings.
 	reserved=$((BASE_RATE_KBIT * (other_count * 2 + 2)))
@@ -267,20 +283,25 @@ verify_tree_skeleton() {
 }
 
 populate_tree() {
-	local dev="$1" handle="$2" total="$3" priority="$4" normal="$5" classid=101 slowid ip
+	local dev="$1" handle="$2" total="$3" priority="$4" direction="$5" forced="$6"
+	local tab id mac ip down up normal classid=101 slowid
 	# Active-tree readback requires this sentinel in addition to the reserved
 	# root handle.
 	tc class add dev "$dev" parent "$handle:1" classid "$handle:$OWNER_CLASS" htb rate "${BASE_RATE_KBIT}kbit" ceil "${BASE_RATE_KBIT}kbit" prio 7 quantum 1514 || return 1
 	tc class add dev "$dev" parent "$handle:1" classid "$handle:10" htb rate "${priority}kbit" ceil "${total}kbit" prio 0 quantum 1514 || return 1
 	tc qdisc add dev "$dev" parent "$handle:10" handle 10: fq_codel limit 256 target 5ms interval 100ms quantum 1514 ecn || return 1
-	for ip in $OTHER_IPS; do
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip down up; do
+		[ -z "$id" ] && continue
+		case "$direction" in down) normal="$down" ;; up) normal="$up" ;; *) return 1 ;; esac
+		[ -z "$forced" ] || normal="$forced"
 		slowid=$((classid + SLOW_OFFSET))
 		tc class add dev "$dev" parent "$handle:1" classid "$handle:$classid" htb rate "${BASE_RATE_KBIT}kbit" ceil "${normal}kbit" prio 1 quantum 1514 || return 1
 		tc qdisc add dev "$dev" parent "$handle:$classid" handle "$classid:" fq_codel limit 256 target 5ms interval 100ms quantum 1514 ecn || return 1
 		tc class add dev "$dev" parent "$handle:1" classid "$handle:$slowid" htb rate "${BASE_RATE_KBIT}kbit" ceil "${degraded_kbit}kbit" prio 2 quantum 1514 || return 1
 		tc qdisc add dev "$dev" parent "$handle:$slowid" handle "$slowid:" fq_codel limit 128 target 10ms interval 200ms quantum 1514 ecn || return 1
 		classid=$((classid + 1))
-	done
+	done < "$DEVICES_FILE"
 }
 
 class_value_matches() {
@@ -290,13 +311,18 @@ class_value_matches() {
 }
 
 verify_tree() {
-	local dev="$1" handle="$2" total="$3" priority="$4" normal="$5" ip classid=101 slowid
+	local dev="$1" handle="$2" total="$3" priority="$4" direction="$5" forced="$6"
+	local tab id mac ip down up normal classid=101 slowid
 	tc qdisc show dev "$dev" | grep -q "qdisc htb $handle: root" || return 1
 	class_value_matches "$dev" "$handle:1" ceil $((total * 125)) || return 1
 	class_value_matches "$dev" "$handle:$OWNER_CLASS" rate $((BASE_RATE_KBIT * 125)) || return 1
 	class_value_matches "$dev" "$handle:10" rate $((priority * 125)) || return 1
 	class_value_matches "$dev" "$handle:20" ceil $((degraded_kbit * 125)) || return 1
-	for ip in $OTHER_IPS; do
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip down up; do
+		[ -z "$id" ] && continue
+		case "$direction" in down) normal="$down" ;; up) normal="$up" ;; *) return 1 ;; esac
+		[ -z "$forced" ] || normal="$forced"
 		slowid=$((classid + SLOW_OFFSET))
 		class_value_matches "$dev" "$handle:$classid" rate $((BASE_RATE_KBIT * 125)) || return 1
 		class_value_matches "$dev" "$handle:$classid" ceil $((normal * 125)) || return 1
@@ -304,7 +330,7 @@ verify_tree() {
 		tc qdisc show dev "$dev" | grep -q "qdisc fq_codel $classid:" || return 1
 		tc qdisc show dev "$dev" | grep -q "qdisc fq_codel $slowid:" || return 1
 		classid=$((classid + 1))
-	done
+	done < "$DEVICES_FILE"
 }
 
 classifier_owned() {
@@ -366,7 +392,7 @@ save_manifest() {
 }
 
 write_applied_snapshot() {
-	local scope="${1:-last_apply}" tmp="$STATE_DIR/applied-snapshot.tmp" ip
+	local scope="${1:-last_apply}" tmp="$STATE_DIR/applied-snapshot.tmp" ip tab id mac down up
 	case "$scope" in last_apply|safe_fallback) ;; *) return 1 ;; esac
 	{
 		printf 'applied_at=%s\n' "$(date +%s)"
@@ -379,6 +405,11 @@ write_applied_snapshot() {
 		printf 'degraded_kbit=%s\n' "$degraded_kbit"
 		printf 'other_count=%s\n' "$other_count"
 		for ip in $PRIORITY_IPS; do printf 'priority_ip=%s\n' "$ip"; done
+		tab="$(printf '\t')"
+		while IFS="$tab" read -r id mac ip down up; do
+			if [ "$scope" = 'safe_fallback' ]; then down="$degraded_kbit"; up="$degraded_kbit"; fi
+			[ -z "$id" ] || printf 'device\t%s\t%s\t%s\t%s\n' "$id" "$ip" "$down" "$up"
+		done < "$DEVICES_FILE"
 	} > "$tmp" && mv "$tmp" "$STATE_DIR/applied-snapshot"
 }
 
@@ -508,12 +539,12 @@ activate_safe_fallback() {
 	install_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" || return 1
 	install_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || return 1
 	verify_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" && verify_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || return 1
-	populate_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$degraded_kbit" || return 1
-	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$degraded_kbit" || return 1
+	populate_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up "$degraded_kbit" || return 1
+	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down "$degraded_kbit" || return 1
 	install_classifier || return 1
 	created_classifier=1
-	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$degraded_kbit" &&
-		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$degraded_kbit" &&
+	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up "$degraded_kbit" &&
+		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down "$degraded_kbit" &&
 		local_output_classifier_ok || return 1
 	[ "$require_accounting" != '1' ] || accounting_classifier_ok || return 1
 	write_applied_snapshot safe_fallback || return 1
@@ -590,11 +621,11 @@ start_service() {
 	install_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" || { fail_after_clear 'Falló el esqueleto HTB seguro de subida.'; return 1; }
 	install_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || { fail_after_clear 'Falló el esqueleto HTB seguro de descarga.'; return 1; }
 	verify_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" && verify_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || { fail_after_clear 'Falló el readback de los esqueletos preventivos.'; return 1; }
-	populate_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$other_up_kbit" || { fail_after_clear 'Falló el árbol HTB de subida.'; return 1; }
-	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$other_down_kbit" || { fail_after_clear 'Falló el árbol HTB de descarga.'; return 1; }
+	populate_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up '' || { fail_after_clear 'Falló el árbol HTB de subida.'; return 1; }
+	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down '' || { fail_after_clear 'Falló el árbol HTB de descarga.'; return 1; }
 	install_classifier || { fail_after_clear 'Falló el clasificador prioritario.'; return 1; }
 	created_classifier=1
-	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$other_up_kbit" && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$other_down_kbit" && accounting_classifier_ok && local_output_classifier_ok || { fail_after_clear 'Falló el readback del límite individual o del acceso local al router.'; return 1; }
+	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up '' && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down '' && accounting_classifier_ok && local_output_classifier_ok || { fail_after_clear 'Falló el readback del límite individual o del acceso local al router.'; return 1; }
 	remove_gate || { write_failure_state 'El shaping quedó instalado, pero la protección transitoria no pudo retirarse.'; return 1; }
 	write_applied_snapshot last_apply || { write_failure_state 'El shaping quedó instalado, pero no se pudo publicar su manifiesto aplicado.'; return 1; }
 	printf '%s\n' active > "$STATE_DIR/owned"

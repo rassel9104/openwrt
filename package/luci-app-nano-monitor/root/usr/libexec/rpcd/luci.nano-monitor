@@ -4,6 +4,7 @@
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
+. /usr/libexec/nano-monitor/device-policy
 
 WORK_DIR='/var/run/nano-monitor'
 LOCK_DIR="$WORK_DIR/lock"
@@ -12,6 +13,7 @@ HELPER='/usr/libexec/nano-monitor/run-speedtest'
 SHAPER_STATE_DIR='/var/run/nano-shaper'
 ACCOUNT_STATE_DIR='/var/run/nano-accounting'
 ACCOUNT_SNAPSHOT="$ACCOUNT_STATE_DIR/current-snapshot"
+MIGRATION_FILE='/etc/nano-monitor/v4-migration'
 DEVICE_REGISTRY='/usr/libexec/nano-monitor/device-registry'
 RECONCILE='/etc/hotplug.d/dhcp/95-nano-shaper'
 WAN_HANDLE=1001
@@ -182,13 +184,18 @@ nft_quota_bytes() {
 }
 
 runtime_accounting_ok() {
-	local rules lan_if wan_network wan_if ip expected="$1" actual configured registry tab id mac name
+	local rules lan_if wan_network wan_if ip expected="$1" actual configured registry tab id mac name period_day other_down other_up total_down total_up degraded
 	[ "$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)" = 'active' ] || return 1
 	config_load bwlimit
 	[ "$(uci -q get bwlimit.main.quota_enabled)" = '1' ] || return 1
 	config_get lan_if main lan_if 'br-lan'
 	config_get wan_network main wan_network 'provider'
 	config_get configured main quota_per_device_bytes '700000000'
+	config_get other_down main other_down_kbit '768'
+	config_get other_up main other_up_kbit '128'
+	config_get total_down main total_down_kbit '8800'
+	config_get total_up main total_up_kbit '4200'
+	config_get degraded main other_degraded_kbit '64'
 	[ -n "$expected" ] && configured="$expected"
 	is_uint "$configured" || return 1
 	wan_if="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
@@ -201,11 +208,14 @@ runtime_accounting_ok() {
 	done
 	[ -x "$DEVICE_REGISTRY" ] || return 1
 	registry="$($DEVICE_REGISTRY)" || return 1
+	period_day="$(sed -n 's/^day=//p' "$ACCOUNT_SNAPSHOT" 2>/dev/null | sed -n '1p')"
+	case "$period_day" in ????-??-??) ;; *) return 1 ;; esac
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip name; do
 		[ -z "$id" ] && continue
+		load_device_policy "$id" "$mac" "$period_day" "$configured" "$other_down" "$other_up" "$total_down" "$total_up" "$degraded" || return 1
 		actual="$(nft_quota_bytes "$id")" || return 1
-		[ "$actual" = "$configured" ] || return 1
+		[ "$actual" = "$POLICY_LIMIT_BYTES" ] || return 1
 		printf '%s\n' "$rules" | grep -Fq "q_$id" || return 1
 	done <<EOF
 $registry
@@ -235,17 +245,22 @@ restore_quota_value() {
 	uci -q set bwlimit.main.quota_per_device_bytes="$value" || return 1
 	uci -q commit bwlimit || return 1
 	[ "$(uci -q get bwlimit.main.quota_per_device_bytes)" = "$value" ] || return 1
-	"$RECONCILE" reconcile >/dev/null 2>&1 || return 1
+	"$RECONCILE" reconcile 6>&- >/dev/null 2>&1 || return 1
 	wait_accounting_quota "$value"
 }
 
 method_accounting() {
-	local internet_up=0 internet_down=0 priority_up=0 priority_down=0 others_up=0 others_down=0 quota_bytes=700000000 quota_enabled=0 quota_used remaining verified period_day timezone reset_hour=0 reset_minute=1 reset_at data_ok=1 value registry tab id mac ip name used left degraded device_count capacity degraded_count account_state account_message updated_at verified_at now age snapshot line configured_quota configured_enabled configured_reset_hour configured_reset_minute generation_before generation_after
+	local internet_up=0 internet_down=0 priority_up=0 priority_down=0 others_up=0 others_down=0 quota_bytes=700000000 quota_enabled=0 migration_hold=0 quota_used remaining verified period_day timezone reset_hour=0 reset_minute=1 reset_at data_ok=1 value registry tab id mac ip name used limit bonus down up left degraded device_count capacity bonus_total degraded_count account_state account_message updated_at verified_at now age snapshot line configured_quota configured_enabled configured_reset_hour configured_reset_minute configured_down configured_up configured_total_down configured_total_up configured_degraded generation_before generation_after
 	config_load bwlimit
 	config_get_bool configured_enabled main quota_enabled 1
 	config_get configured_quota main quota_per_device_bytes '700000000'
 	config_get configured_reset_hour main quota_reset_hour '0'
 	config_get configured_reset_minute main quota_reset_minute '1'
+	config_get configured_down main other_down_kbit '768'
+	config_get configured_up main other_up_kbit '128'
+	config_get configured_total_down main total_down_kbit '8800'
+	config_get configured_total_up main total_up_kbit '4200'
+	config_get configured_degraded main other_degraded_kbit '64'
 	[ -f "$ACCOUNT_SNAPSHOT" ] && [ ! -L "$ACCOUNT_SNAPSHOT" ] || data_ok=0
 	generation_before="$(cat "$ACCOUNT_STATE_DIR/generation" 2>/dev/null)"
 	account_state="$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)"
@@ -262,6 +277,7 @@ method_accounting() {
 			day=*) period_day="${line#*=}" ;;
 			quota_enabled=*) quota_enabled="${line#*=}" ;;
 			quota_bytes=*) quota_bytes="${line#*=}" ;;
+			migration_hold=*) migration_hold="${line#*=}" ;;
 			reset_hour=*) reset_hour="${line#*=}" ;;
 			reset_minute=*) reset_minute="${line#*=}" ;;
 			internet_up=*) internet_up="${line#*=}" ;;
@@ -282,6 +298,7 @@ EOF
 	done
 	is_uint "$quota_bytes" && uint_ge "$quota_bytes" 100000000 && uint_ge 1000000000000 "$quota_bytes" || { quota_bytes=700000000; data_ok=0; }
 	[ "$quota_enabled" = '1' ] || data_ok=0
+	case "$migration_hold" in 0|1) ;; *) migration_hold=0; data_ok=0 ;; esac
 	is_uint "$reset_hour" && is_uint "$reset_minute" && [ "$reset_hour" -le 23 ] && [ "$reset_minute" -le 59 ] || { reset_hour=0; reset_minute=1; data_ok=0; }
 	[ "$configured_enabled" = "$quota_enabled" ] && [ "$configured_quota" = "$quota_bytes" ] && [ "$configured_reset_hour" = "$reset_hour" ] && [ "$configured_reset_minute" = "$reset_minute" ] || data_ok=0
 	case "$period_day" in ????-??-??) ;; *) period_day="$(date +%F)"; data_ok=0 ;; esac
@@ -300,21 +317,30 @@ EOF
 	fi
 	quota_used=0
 	remaining=0
+	capacity=0
+	bonus_total=0
 	device_count=0
 	degraded_count=0
 	tab="$(printf '\t')"
-	while IFS="$tab" read -r id mac ip name used; do
+	while IFS="$tab" read -r id mac ip name used limit bonus down up; do
 		[ -z "$id" ] && continue
 		is_uint "$used" || { used=0; data_ok=0; }
-		left="$(uint_sub_floor "$quota_bytes" "$used")"
+		is_uint "$limit" || { limit="$quota_bytes"; data_ok=0; }
+		is_uint "$bonus" || { bonus=0; data_ok=0; }
+		is_uint "$down" || { down="$configured_down"; data_ok=0; }
+		is_uint "$up" || { up="$configured_up"; data_ok=0; }
+		left="$(uint_sub_floor "$limit" "$used")"
 		quota_used="$(awk -v a="$quota_used" -v b="$used" 'BEGIN { printf "%.0f", a + b }')"
 		remaining="$(awk -v a="$remaining" -v b="$left" 'BEGIN { printf "%.0f", a + b }')"
+		capacity="$(awk -v a="$capacity" -v b="$limit" 'BEGIN { printf "%.0f", a + b }')"
+		bonus_total="$(awk -v a="$bonus_total" -v b="$bonus" 'BEGIN { printf "%.0f", a + b }')"
 		device_count=$((device_count + 1))
-		uint_ge "$used" "$quota_bytes" && degraded_count=$((degraded_count + 1))
+		if [ "$migration_hold" = '1' ] || uint_ge "$used" "$limit"; then
+			degraded_count=$((degraded_count + 1))
+		fi
 	done <<EOF
 $registry
 EOF
-	capacity="$(uint_mul "$quota_bytes" "$device_count")"
 	verified='0'
 	[ "$data_ok" = '1' ] && [ "$account_state" = 'active' ] && verified='1'
 	timezone="$(uci -q get system.@system[0].zonename)"
@@ -330,7 +356,14 @@ EOF
 	json_add_string reset_at "$reset_at"
 	json_add_string quota_enabled "$quota_enabled"
 	json_add_string quota_bytes "$quota_bytes"
+	json_add_string migration_hold "$migration_hold"
 	json_add_string quota_capacity "$capacity"
+	json_add_string quota_bonus_total "$bonus_total"
+	json_add_string default_down_kbit "$configured_down"
+	json_add_string default_up_kbit "$configured_up"
+	json_add_string max_down_kbit "$configured_total_down"
+	json_add_string max_up_kbit "$configured_total_up"
+	json_add_string degraded_kbit "$configured_degraded"
 	json_add_string quota_used "$quota_used"
 	json_add_string quota_remaining "$remaining"
 	json_add_string blocked '0'
@@ -343,20 +376,28 @@ EOF
 	json_add_string others_up "$others_up"
 	json_add_string others_down "$others_down"
 	json_add_array devices
-	while IFS="$tab" read -r id mac ip name used; do
+	while IFS="$tab" read -r id mac ip name used limit bonus down up; do
 		[ -z "$id" ] && continue
 		is_uint "$used" || used=0
-		left="$(uint_sub_floor "$quota_bytes" "$used")"
+		is_uint "$limit" || limit="$quota_bytes"
+		is_uint "$bonus" || bonus=0
+		is_uint "$down" || down="$configured_down"
+		is_uint "$up" || up="$configured_up"
+		left="$(uint_sub_floor "$limit" "$used")"
 		degraded='0'
-		uint_ge "$used" "$quota_bytes" && degraded='1'
+		if [ "$migration_hold" = '1' ] || uint_ge "$used" "$limit"; then degraded='1'; fi
 		json_add_object ''
 		json_add_string id "$id"
 		json_add_string mac "$mac"
 		json_add_string ip "$ip"
 		json_add_string name "$name"
 		json_add_string used "$used"
+		json_add_string limit_bytes "$limit"
+		json_add_string bonus_bytes "$bonus"
 		json_add_string remaining "$left"
 		json_add_string degraded "$degraded"
+		json_add_string down_kbit "$down"
+		json_add_string up_kbit "$up"
 		json_close_object
 	done <<EOF
 $registry
@@ -454,8 +495,13 @@ rpc_filter_mapping_matches() {
 }
 
 rpc_other_classes_ok() {
-	local dev="$1" handle="$2" normal="$3" degraded="$4" ip normal_id=101 slow_id=$((101 + SLOW_OFFSET))
-	for ip in $RPC_OTHER_IPS; do
+	local dev="$1" handle="$2" direction="$3" degraded="$4" tab id mac ip down up normal normal_id=101 slow_id=$((101 + SLOW_OFFSET))
+	[ -f "$SHAPER_STATE_DIR/devices" ] && [ ! -L "$SHAPER_STATE_DIR/devices" ] || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip down up; do
+		[ -z "$id" ] && continue
+		case "$direction" in down) normal="$down" ;; up) normal="$up" ;; *) return 1 ;; esac
+		is_uint "$normal" || return 1
 		tc_class_value_matches "$dev" "$handle:$normal_id" rate 125 || return 1
 		tc_class_value_matches "$dev" "$handle:$normal_id" ceil $((normal * 125)) || return 1
 		tc_class_value_matches "$dev" "$handle:$slow_id" rate 125 || return 1
@@ -464,7 +510,7 @@ rpc_other_classes_ok() {
 		tc qdisc show dev "$dev" | grep -q "qdisc fq_codel $slow_id:" || return 1
 		normal_id=$((normal_id + 1))
 		slow_id=$((slow_id + 1))
-	done
+	done < "$SHAPER_STATE_DIR/devices"
 }
 
 runtime_shaper_ok() {
@@ -506,8 +552,8 @@ runtime_shaper_ok() {
 	tc_class_value_matches "$lan_if" "$LAN_HANDLE:20" ceil $((degraded * 125)) || return 1
 	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 10:' || return 1
 	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 20:' || return 1
-	rpc_other_classes_ok "$wan_if" "$WAN_HANDLE" "$effective_up" "$degraded" || return 1
-	rpc_other_classes_ok "$lan_if" "$LAN_HANDLE" "$effective_down" "$degraded" || return 1
+	rpc_other_classes_ok "$wan_if" "$WAN_HANDLE" up "$degraded" || return 1
+	rpc_other_classes_ok "$lan_if" "$LAN_HANDLE" down "$degraded" || return 1
 	rules="$(nft list table inet nano_shaper 2>/dev/null)" || return 1
 	printf '%s\n' "$rules" | grep -Fq 'comment "nano-monitor-owned-v1"' || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$lan_if\" oifname \"$wan_if\"" || return 1
@@ -605,8 +651,243 @@ EOF
 	json_cleanup
 }
 
+resolve_registry_device() {
+	local wanted="$1" registry tab id mac ip name
+	TARGET_ID=''; TARGET_MAC=''; TARGET_IP=''; TARGET_NAME=''
+	[ -x "$DEVICE_REGISTRY" ] || return 1
+	registry="$($DEVICE_REGISTRY)" || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ "$id" = "$wanted" ] || continue
+		[ -z "$TARGET_ID" ] || return 1
+		TARGET_ID="$id"; TARGET_MAC="$mac"; TARGET_IP="$ip"; TARGET_NAME="$name"
+	done <<EOF
+$registry
+EOF
+	[ "$TARGET_ID" = "$wanted" ]
+}
+
+acquire_mutation_lock() {
+	local attempt=0
+	command -v flock >/dev/null 2>&1 || return 1
+	prepare_work_dir || return 1
+	[ ! -L "$WORK_DIR/mutation.lock" ] || return 1
+	exec 6>"$WORK_DIR/mutation.lock" || return 1
+	while ! flock -n 6; do
+		[ "$attempt" -lt 10 ] || { exec 6>&-; return 1; }
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+}
+
+device_section_options_known() {
+	local section="$1" output line option
+	output="$(uci -q show "bwlimit.$section")" || return 1
+	[ -n "$output" ] || return 1
+	while IFS= read -r line; do
+		case "$line" in
+			"bwlimit.$section=device") ;;
+			"bwlimit.$section."*=*)
+				option="${line#bwlimit.$section.}"
+				option="${option%%=*}"
+				case "$option" in
+					device_id|mac|bonus_day|bonus_bytes|down_kbit|up_kbit) ;;
+					*) return 1 ;;
+				esac
+			;;
+			*) return 1 ;;
+		esac
+	done <<EOF
+$output
+EOF
+}
+
+capture_device_section() {
+	local section="$1" type
+	OLD_EXISTS=0
+	type="$(uci -q get "bwlimit.$section")"
+	[ -n "$type" ] || return 0
+	[ "$type" = 'device' ] || return 1
+	device_section_options_known "$section" || return 1
+	OLD_EXISTS=1
+	OLD_DEVICE_ID="$(uci -q get "bwlimit.$section.device_id")"
+	OLD_MAC="$(uci -q get "bwlimit.$section.mac")"
+	[ "$OLD_DEVICE_ID" = "$TARGET_ID" ] && [ "$OLD_MAC" = "$TARGET_MAC" ] || return 1
+	OLD_BONUS_DAY="$(uci -q get "bwlimit.$section.bonus_day")"
+	OLD_BONUS_BYTES="$(uci -q get "bwlimit.$section.bonus_bytes")"
+	OLD_DOWN="$(uci -q get "bwlimit.$section.down_kbit")"
+	OLD_UP="$(uci -q get "bwlimit.$section.up_kbit")"
+	return 0
+}
+
+restore_device_section() {
+	local section="$1"
+	uci -q delete "bwlimit.$section" 2>/dev/null || :
+	if [ "$OLD_EXISTS" = '1' ]; then
+		uci -q set "bwlimit.$section=device" || return 1
+		uci -q set "bwlimit.$section.device_id=$OLD_DEVICE_ID" || return 1
+		uci -q set "bwlimit.$section.mac=$OLD_MAC" || return 1
+		[ -z "$OLD_BONUS_DAY" ] || uci -q set "bwlimit.$section.bonus_day=$OLD_BONUS_DAY" || return 1
+		[ -z "$OLD_BONUS_BYTES" ] || uci -q set "bwlimit.$section.bonus_bytes=$OLD_BONUS_BYTES" || return 1
+		[ -z "$OLD_DOWN" ] || uci -q set "bwlimit.$section.down_kbit=$OLD_DOWN" || return 1
+		[ -z "$OLD_UP" ] || uci -q set "bwlimit.$section.up_kbit=$OLD_UP" || return 1
+	fi
+	uci -q commit bwlimit
+}
+
+write_device_policy() {
+	local section="$1" day="$2" bonus="$3" down="$4" up="$5" base_down="$6" base_up="$7"
+	uci -q delete "bwlimit.$section" 2>/dev/null || :
+	if [ "$bonus" = '0' ] && [ "$down" = "$base_down" ] && [ "$up" = "$base_up" ]; then
+		uci -q commit bwlimit
+		return
+	fi
+	uci -q set "bwlimit.$section=device" || return 1
+	uci -q set "bwlimit.$section.device_id=$TARGET_ID" || return 1
+	uci -q set "bwlimit.$section.mac=$TARGET_MAC" || return 1
+	if [ "$bonus" != '0' ]; then
+		uci -q set "bwlimit.$section.bonus_day=$day" || return 1
+		uci -q set "bwlimit.$section.bonus_bytes=$bonus" || return 1
+	fi
+	[ "$down" = "$base_down" ] || uci -q set "bwlimit.$section.down_kbit=$down" || return 1
+	[ "$up" = "$base_up" ] || uci -q set "bwlimit.$section.up_kbit=$up" || return 1
+	uci -q commit bwlimit
+}
+
+runtime_device_policy_ok() {
+	local id="$1" expected_limit="$2" expected_bonus="$3" expected_down="$4" expected_up="$5"
+	local period_day base_quota base_down base_up total_down total_up degraded actual tab marker sid smac sip sname sused slimit sbonus sdown sup
+	local devices did dmac dip ddown dup classid=101 target_classid='' found=0 wan_if lan_if generation_before generation_after
+	config_load bwlimit
+	config_get base_quota main quota_per_device_bytes '700000000'
+	config_get base_down main other_down_kbit '768'
+	config_get base_up main other_up_kbit '128'
+	config_get total_down main total_down_kbit '8800'
+	config_get total_up main total_up_kbit '4200'
+	config_get degraded main other_degraded_kbit '64'
+	period_day="$(sed -n 's/^day=//p' "$ACCOUNT_SNAPSHOT" 2>/dev/null | sed -n '1p')"
+	case "$period_day" in ????-??-??) ;; *) return 1 ;; esac
+	resolve_registry_device "$id" || return 1
+	load_device_policy "$id" "$TARGET_MAC" "$period_day" "$base_quota" "$base_down" "$base_up" "$total_down" "$total_up" "$degraded" || return 1
+	[ "$POLICY_LIMIT_BYTES" = "$expected_limit" ] && [ "$POLICY_BONUS_BYTES" = "$expected_bonus" ] && [ "$POLICY_DOWN_KBIT" = "$expected_down" ] && [ "$POLICY_UP_KBIT" = "$expected_up" ] || return 1
+	actual="$(nft_quota_bytes "$id")" || return 1
+	[ "$actual" = "$expected_limit" ] || return 1
+	[ "$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)" = 'active' ] || return 1
+	tab="$(printf '\t')"
+	marker="$(awk -F '\t' -v wanted="$id" '$1 == "device" && $2 == wanted { print; exit }' "$ACCOUNT_SNAPSHOT" 2>/dev/null)"
+	[ -n "$marker" ] || return 1
+	IFS="$tab" read -r marker sid smac sip sname sused slimit sbonus sdown sup <<EOF
+$marker
+EOF
+	[ "$sid" = "$id" ] && [ "$smac" = "$TARGET_MAC" ] && [ "$slimit" = "$expected_limit" ] && [ "$sbonus" = "$expected_bonus" ] && [ "$sdown" = "$expected_down" ] && [ "$sup" = "$expected_up" ] || return 1
+	generation_before="$(cat "$SHAPER_STATE_DIR/generation" 2>/dev/null)"
+	is_uint "$generation_before" && [ $((generation_before % 2)) -eq 0 ] || return 1
+	[ "$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)" = 'active' ] && [ "$(cat "$SHAPER_STATE_DIR/owned" 2>/dev/null)" = 'active' ] || return 1
+	[ -f "$SHAPER_STATE_DIR/devices" ] && [ ! -L "$SHAPER_STATE_DIR/devices" ] || return 1
+	devices="$(cat "$SHAPER_STATE_DIR/devices" 2>/dev/null)" || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r did dmac dip ddown dup; do
+		[ -z "$did" ] && continue
+		if [ "$did" = "$id" ]; then
+			found=$((found + 1))
+			target_classid="$classid"
+			[ "$dmac" = "$TARGET_MAC" ] && [ "$ddown" = "$expected_down" ] && [ "$dup" = "$expected_up" ] || return 1
+		fi
+		classid=$((classid + 1))
+	done <<EOF
+$devices
+EOF
+	[ "$found" = '1' ] || return 1
+	wan_if="$(cat "$SHAPER_STATE_DIR/wan_if" 2>/dev/null)"
+	lan_if="$(cat "$SHAPER_STATE_DIR/lan_if" 2>/dev/null)"
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:$target_classid" ceil $((expected_up * 125)) || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:$target_classid" ceil $((expected_down * 125)) || return 1
+	generation_after="$(cat "$SHAPER_STATE_DIR/generation" 2>/dev/null)"
+	[ "$generation_before" = "$generation_after" ] && [ "$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)" = 'active' ]
+}
+
+wait_device_policy() {
+	local attempt=0
+	while [ "$attempt" -lt 5 ]; do
+		runtime_device_policy_ok "$@" && return 0
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+method_set_device_policy() {
+	local input keys key requested_id requested_bonus requested_down requested_up section period_day
+	local base_quota base_down base_up total_down total_up degraded bonus_bytes expected_limit old_limit old_bonus old_down old_up rc migration_hold generation_before generation_after
+	input="$(cat)"
+	json_load "$input" 2>/dev/null || { json_error 'Solicitud JSON no válida.'; return 1; }
+	json_get_keys keys
+	for key in $keys; do
+		case "$key" in ubus_rpc_session|device_id|bonus_mb|down_kbit|up_kbit) ;; *)
+			json_error "Argumento no permitido: $key"; json_cleanup; return 1
+		;; esac
+	done
+	json_get_var requested_id device_id
+	json_get_var requested_bonus bonus_mb
+	json_get_var requested_down down_kbit
+	json_get_var requested_up up_kbit
+	json_cleanup
+	policy_valid_id "$requested_id" || { json_error 'La identidad del dispositivo no es válida.'; return 1; }
+	for value in "$requested_bonus" "$requested_down" "$requested_up"; do
+		is_uint "$value" || { json_error 'MB y velocidades deben ser números enteros.'; return 1; }
+	done
+	acquire_mutation_lock || { json_error 'No se pudo bloquear la configuración.'; return 1; }
+	if [ -e "$MIGRATION_FILE" ] || [ -L "$MIGRATION_FILE" ]; then
+		json_error 'La migración preventiva debe completar su reset diario antes de ajustar un dispositivo.'
+		return 1
+	fi
+	generation_before="$(cat "$ACCOUNT_STATE_DIR/generation" 2>/dev/null)"
+	migration_hold="$(sed -n 's/^migration_hold=//p' "$ACCOUNT_SNAPSHOT" 2>/dev/null | sed -n '1p')"
+	generation_after="$(cat "$ACCOUNT_STATE_DIR/generation" 2>/dev/null)"
+	if ! is_uint "$generation_before" || [ $((generation_before % 2)) -ne 0 ] || [ "$generation_before" != "$generation_after" ] || [ "$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)" != 'active' ] || [ "$migration_hold" != '0' ]; then
+		json_error 'La contabilidad individual aún no publicó un periodo estable sin migración preventiva.'
+		return 1
+	fi
+	config_load bwlimit
+	config_get base_quota main quota_per_device_bytes '700000000'
+	config_get base_down main other_down_kbit '768'
+	config_get base_up main other_up_kbit '128'
+	config_get total_down main total_down_kbit '8800'
+	config_get total_up main total_up_kbit '4200'
+	config_get degraded main other_degraded_kbit '64'
+	[ "$requested_bonus" -le 1000000 ] || { json_error 'La compensación no puede superar 1.000.000 MB.'; return 1; }
+	[ "$requested_down" -ge "$degraded" ] && [ "$requested_down" -le "$total_down" ] || { json_error "La descarga debe estar entre $degraded y $total_down Kbit/s."; return 1; }
+	[ "$requested_up" -ge "$degraded" ] && [ "$requested_up" -le "$total_up" ] || { json_error "La subida debe estar entre $degraded y $total_up Kbit/s."; return 1; }
+	bonus_bytes="$(uint_mul "$requested_bonus" 1000000)"
+	expected_limit="$(awk -v q="$base_quota" -v b="$bonus_bytes" 'BEGIN { printf "%.0f", q+b }')"
+	uint_ge 1000000000000 "$expected_limit" || { json_error 'La cuota efectiva supera el máximo seguro.'; return 1; }
+	resolve_registry_device "$requested_id" || { json_error 'El dispositivo ya no pertenece a Otros.'; return 1; }
+	period_day="$(sed -n 's/^day=//p' "$ACCOUNT_SNAPSHOT" 2>/dev/null | sed -n '1p')"
+	case "$period_day" in ????-??-??) ;; *) json_error 'El periodo diario no está verificado.'; return 1 ;; esac
+	section="$(policy_section_for "$requested_id")" || { json_error 'No se pudo resolver la sección individual.'; return 1; }
+	capture_device_section "$section" || { json_error 'La configuración individual existente no conserva su identidad.'; return 1; }
+	load_device_policy "$requested_id" "$TARGET_MAC" "$period_day" "$base_quota" "$base_down" "$base_up" "$total_down" "$total_up" "$degraded" || { json_error 'La configuración individual anterior no es válida.'; return 1; }
+	old_limit="$POLICY_LIMIT_BYTES"; old_bonus="$POLICY_BONUS_BYTES"; old_down="$POLICY_DOWN_KBIT"; old_up="$POLICY_UP_KBIT"
+	if ! write_device_policy "$section" "$period_day" "$bonus_bytes" "$requested_down" "$requested_up" "$base_down" "$base_up"; then
+		restore_device_section "$section" >/dev/null 2>&1
+		json_error 'No se pudo guardar el ajuste individual.'
+		return 1
+	fi
+	"$RECONCILE" reconcile 6>&- >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -ne 0 ] || ! wait_device_policy "$requested_id" "$expected_limit" "$bonus_bytes" "$requested_down" "$requested_up"; then
+		if restore_device_section "$section" && "$RECONCILE" reconcile 6>&- >/dev/null 2>&1 && wait_device_policy "$requested_id" "$old_limit" "$old_bonus" "$old_down" "$old_up"; then
+			json_error 'No se pudo verificar el ajuste; se restauraron y verificaron los valores anteriores.'
+		else
+			json_error 'No se pudo verificar el ajuste ni su restauración; revise contabilidad y shaping.'
+		fi
+		return 1
+	fi
+	method_accounting
+}
+
 method_set_quota() {
-	local input keys key requested old rc attempt
+	local input keys key requested old rc
 	input="$(cat)"
 	json_load "$input" 2>/dev/null || {
 		json_error 'Solicitud JSON no válida.'
@@ -631,6 +912,7 @@ method_set_quota() {
 		return 1
 	fi
 	requested="$(uint_mul "$requested" 1000000)"
+	acquire_mutation_lock || { json_error 'No se pudo bloquear la configuración.'; return 1; }
 	old="$(uci -q get bwlimit.main.quota_per_device_bytes)"
 	is_uint "$old" || old='700000000'
 	if ! uci -q set bwlimit.main.quota_per_device_bytes="$requested" ||
@@ -643,7 +925,7 @@ method_set_quota() {
 		fi
 		return 1
 	fi
-	"$RECONCILE" reconcile >/dev/null 2>&1
+	"$RECONCILE" reconcile 6>&- >/dev/null 2>&1
 	rc=$?
 	if [ "$rc" -ne 0 ] || ! wait_accounting_quota "$requested"; then
 		if restore_quota_value "$old"; then
@@ -670,6 +952,12 @@ case "$1" in
 		json_add_object set_quota
 		json_add_string quota_mb 'Integer'
 		json_close_object
+		json_add_object set_device_policy
+		json_add_string device_id 'String'
+		json_add_string bonus_mb 'Integer'
+		json_add_string down_kbit 'Integer'
+		json_add_string up_kbit 'Integer'
+		json_close_object
 		json_dump
 		json_cleanup
 		;;
@@ -681,6 +969,9 @@ case "$1" in
 				;;
 			set_quota)
 				method_set_quota
+				;;
+			set_device_policy)
+				method_set_device_policy
 				;;
 			*)
 				json_error 'Método no permitido.'

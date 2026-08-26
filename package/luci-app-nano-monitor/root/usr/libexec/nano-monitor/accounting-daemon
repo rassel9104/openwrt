@@ -3,6 +3,7 @@
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
 . /lib/functions.sh
+. /usr/libexec/nano-monitor/device-policy
 
 TABLE_FAMILY='inet'
 TABLE_NAME='nano_accounting'
@@ -30,7 +31,6 @@ SLOW_OFFSET=1000
 MAX_DEVICES=900
 POLL_INTERVAL=10
 VERIFICATION_INTERVAL=300
-BOOT_GUARD_SECONDS=60
 export TZ
 
 is_uint() {
@@ -110,22 +110,24 @@ load_settings() {
 	config_get reset_minute main quota_reset_minute '1'
 	config_get total_down_kbit main total_down_kbit '8800'
 	config_get total_up_kbit main total_up_kbit '4200'
+	config_get other_down_kbit main other_down_kbit '768'
+	config_get other_up_kbit main other_up_kbit '128'
+	config_get degraded_kbit main other_degraded_kbit '64'
 	[ "$(uci -q get system.@system[0].zonename)" = 'America/New_York' ] || return 1
 	[ "$(uci -q get system.@system[0].timezone)" = "$TZ" ] || return 1
 	PRIORITY_SET=''
 	config_list_foreach main exempt_ip add_priority_ip
 	[ -n "$PRIORITY_SET" ] || return 1
-	for value in "$quota_bytes" "$persist_interval" "$persist_step" "$reset_hour" "$reset_minute" "$total_down_kbit" "$total_up_kbit"; do
+	for value in "$quota_bytes" "$persist_interval" "$persist_step" "$reset_hour" "$reset_minute" "$total_down_kbit" "$total_up_kbit" "$other_down_kbit" "$other_up_kbit" "$degraded_kbit"; do
 		is_uint "$value" || return 1
 	done
 	uint_ge "$quota_bytes" 100000000 || return 1
 	uint_ge 1000000000000 "$quota_bytes" || return 1
 	[ "$persist_interval" -ge 60 ] && [ "$persist_step" -ge 1000000 ] || return 1
 	[ "$reset_hour" -le 23 ] && [ "$reset_minute" -le 59 ] || return 1
-	# Covers a complete early-boot/network convergence window at the aggregate
-	# ceiling. persist_step adds a second durable margin between writes.
-	recovery_guard_bytes="$(awk -v d="$total_down_kbit" -v u="$total_up_kbit" -v s="$BOOT_GUARD_SECONDS" 'BEGIN { printf "%.0f", (d+u)*1000*s/8 }')"
-	is_uint "$recovery_guard_bytes" || return 1
+	[ "$degraded_kbit" -ge 32 ] || return 1
+	[ "$other_down_kbit" -ge "$degraded_kbit" ] && [ "$other_down_kbit" -le "$total_down_kbit" ] || return 1
+	[ "$other_up_kbit" -ge "$degraded_kbit" ] && [ "$other_up_kbit" -le "$total_up_kbit" ] || return 1
 	reset_at_minute=$((reset_hour * 60 + reset_minute))
 	valid_iface "$lan_if" && [ -d "/sys/class/net/$lan_if" ] || return 1
 	case "$subnet" in ''|*[!0-9./]*) return 1 ;; esac
@@ -133,6 +135,10 @@ load_settings() {
 	wan_if="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	valid_iface "$wan_if" && [ -d "/sys/class/net/$wan_if" ] || return 1
 	build_devices_file
+}
+
+resolve_device_policy() {
+	load_device_policy "$1" "$2" "$period_day" "$quota_bytes" "$other_down_kbit" "$other_up_kbit" "$total_down_kbit" "$total_up_kbit" "$degraded_kbit"
 }
 
 state_value() {
@@ -163,31 +169,35 @@ load_saved_counters() {
 }
 
 device_saved_used() {
-	local id="$1" file="$DEVICE_STATE_DIR/$1" day used reserved live authority=0 saved_valid=0
-	if [ "$force_degraded" = '1' ]; then
-		printf '%s' "$quota_bytes"
+	local id="$1" limit="$2" file="$DEVICE_STATE_DIR/$1" day used live
+	if [ "$migration_active" = '1' ]; then
+		# A surviving table may contain the pre-fix aggregate seed copied into each
+		# quota. Identity is unknown in this mode, so no live per-device value is
+		# authoritative and none may cross into the new durable checkpoints.
+		printf '0'
 		return
-	elif [ "$migration_active" = '1' ]; then
-		used="$migration_seed"
 	elif [ "$deliberate_daily_reset" = '1' ]; then
 		printf '0'
 		return
+	elif [ "$force_degraded" = '1' ]; then
+		printf '%s' "$limit"
+		return
 	elif [ ! -e "$file" ]; then
-		[ "$unclean_start" = '1' ] && used="$quota_bytes" || used=0
+		used=0
 	elif ! [ -f "$file" ] || [ -L "$file" ]; then
-		used="$quota_bytes"
+		used="$limit"
 	else
 		day="$(sed -n 's/^day=//p' "$file" | sed -n '1p')"
 		used="$(sed -n 's/^used=//p' "$file" | sed -n '1p')"
 		if [ "$day" != "$period_day" ] || ! is_uint "$used"; then
-			used="$quota_bytes"
-		else
-			saved_valid=1
+			used="$limit"
 		fi
 	fi
 	# A surviving signed table is the freshest authority. This closes both a
 	# graceful handoff and an arbitrarily long dirty session without guessing a
-	# traffic guard. A deliberate daily reset disables this carry-over.
+	# traffic guard. A deliberate daily reset disables this carry-over. Without
+	# a live authority, restore the exact durable checkpoint: charging every
+	# device a hypothetical maximum outage caused repeated false consumption.
 	if [ "$deliberate_daily_reset" = '0' ]; then
 		if [ "$live_table_present" = '1' ]; then
 			live="$(quota_used_for "$id" 2>/dev/null)"
@@ -195,15 +205,7 @@ device_saved_used() {
 			live="$(awk -v wanted="$id" '$1 == wanted { print $2; exit }' "$LIVE_SEEDS_FILE")"
 		fi
 		if is_uint "$live"; then
-			authority=1
 			if uint_ge "$live" "$used"; then used="$live"; fi
-		fi
-		# Reserve only when no live/snapshotted authority survived and either the
-		# prior session was dirty or this is a new router boot. Same-boot clean
-		# stop/start cycles retain used without artificial consumption.
-		if [ "$saved_valid" = '1' ] && [ "$authority" = '0' ] && { [ "$unclean_start" = '1' ] || [ "$boot_changed" = '1' ]; }; then
-			reserved="$(sed -n 's/^reserved=//p' "$file" | sed -n '1p')"
-			is_uint "$reserved" && used="$reserved" || used="$quota_bytes"
 		fi
 	fi
 	printf '%s' "$used"
@@ -254,15 +256,24 @@ persist_boot_id() {
 	printf '%s\n' "$current_boot_id" > "$BOOT_FILE.tmp" && mv "$BOOT_FILE.tmp" "$BOOT_FILE" && sync
 }
 
-load_migration_seed() {
-	local day used
-	migration_active=0; migration_seed=0
+load_migration_hold() {
+	local day mode
+	migration_active=0
+	migration_marker_day=''
 	[ -e "$MIGRATION_FILE" ] || return 0
-	[ -f "$MIGRATION_FILE" ] && [ ! -L "$MIGRATION_FILE" ] || { migration_active=1; migration_seed="$quota_bytes"; return; }
+	[ -f "$MIGRATION_FILE" ] && [ ! -L "$MIGRATION_FILE" ] || return 1
 	day="$(sed -n 's/^day=//p' "$MIGRATION_FILE" | sed -n '1p')"
-	used="$(sed -n 's/^used=//p' "$MIGRATION_FILE" | sed -n '1p')"
+	mode="$(sed -n 's/^mode=//p' "$MIGRATION_FILE" | sed -n '1p')"
+	case "$day" in ????-??-??) ;; *) return 1 ;; esac
+	# An interrupted build anterior pudo dejar sólo day/used. Trátelo también
+	# como identidad desconocida; nunca reutilice el agregado como cuota propia.
+	case "$mode" in ''|identity-unknown-hold) ;; *) return 1 ;; esac
+	# Never unlink an older marker here. It may be the only durable evidence that
+	# inherited per-device checkpoints are untrustworthy. A verified reset below
+	# is the sole transition allowed to clear it.
+	[ "$day" = "$period_day" ] || [ "$period_day" \> "$day" ] || return 1
+	migration_marker_day="$day"
 	migration_active=1
-	if [ "$day" = "$period_day" ] && is_uint "$used" && uint_ge "$quota_bytes" "$used"; then migration_seed="$used"; else migration_seed="$quota_bytes"; fi
 }
 
 counter_bytes() {
@@ -284,6 +295,10 @@ merge_live_counters() {
 
 snapshot_live_quotas() {
 	local id used tmp="$LIVE_SEEDS_FILE.tmp" ids="$TABLE_IDS_FILE" strict=1
+	# The prior table may contain one copied aggregate in every device quota.
+	# Merely querying those objects is unnecessary and can block installation of
+	# the identity-unknown hold, so discard volatile seeds without reading them.
+	[ "$migration_active" != '1' ] || { rm -f "$tmp" "$LIVE_SEEDS_FILE"; return 0; }
 	[ "$live_table_present" = '1' ] || { rm -f "$LIVE_SEEDS_FILE"; return 0; }
 	if [ ! -f "$ids" ] || [ -L "$ids" ]; then
 		# Upgrade compatibility: recover every quota still present, while allowing
@@ -339,7 +354,7 @@ quota_bytes_for() {
 }
 
 write_current_snapshot() {
-	local tmp="$SNAPSHOT_FILE.tmp" tab id mac ip name used
+	local tmp="$SNAPSHOT_FILE.tmp" tab id mac ip name used limit bonus down up
 	[ ! -L "$SNAPSHOT_FILE" ] || return 1
 	tab="$(printf '\t')"
 	{
@@ -348,6 +363,7 @@ write_current_snapshot() {
 		printf 'day=%s\n' "$period_day"
 		printf 'quota_enabled=%s\n' "$quota_enabled"
 		printf 'quota_bytes=%s\n' "$quota_bytes"
+		printf 'migration_hold=%s\n' "$migration_active"
 		printf 'reset_hour=%s\n' "$reset_hour"
 		printf 'reset_minute=%s\n' "$reset_minute"
 		printf 'internet_up=%s\n' "$internet_up"
@@ -356,14 +372,14 @@ write_current_snapshot() {
 		printf 'priority_down=%s\n' "$priority_down"
 		printf 'others_up=%s\n' "$others_up"
 		printf 'others_down=%s\n' "$others_down"
-		while IFS="$tab" read -r id mac ip name used; do
-			[ -z "$id" ] || printf 'device\t%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$used"
+		while IFS="$tab" read -r id mac ip name used limit bonus down up; do
+			[ -z "$id" ] || printf 'device\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$used" "$limit" "$bonus" "$down" "$up"
 		done < "$CURRENT_FILE"
 	} > "$tmp" && mv "$tmp" "$SNAPSHOT_FILE"
 }
 
 read_counters() {
-	local tab id mac ip name used tmp="$CURRENT_FILE.tmp"
+	local tab id mac ip name used limit bonus down up tmp="$CURRENT_FILE.tmp"
 	internet_up="$(counter_bytes internet_up)" || return 1
 	internet_down="$(counter_bytes internet_down)" || return 1
 	priority_up="$(counter_bytes priority_up)" || return 1
@@ -376,10 +392,15 @@ read_counters() {
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip name; do
 		[ -z "$id" ] && continue
+		resolve_device_policy "$id" "$mac" || { rm -f "$tmp"; return 1; }
+		limit="$POLICY_LIMIT_BYTES"; bonus="$POLICY_BONUS_BYTES"
+		down="$POLICY_DOWN_KBIT"; up="$POLICY_UP_KBIT"
 		used="$(quota_used_for "$id")" || { rm -f "$tmp"; return 1; }
-		printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$used" >> "$tmp" || return 1
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$used" "$limit" "$bonus" "$down" "$up" >> "$tmp" || return 1
 		device_total_used="$(awk -v a="$device_total_used" -v b="$used" 'BEGIN { printf "%.0f", a + b }')"
-		uint_ge "$used" "$quota_bytes" && degraded_count=$((degraded_count + 1))
+		if [ "$migration_active" = '1' ] || uint_ge "$used" "$limit"; then
+			degraded_count=$((degraded_count + 1))
+		fi
 	done < "$DEVICES_FILE"
 	mv "$tmp" "$CURRENT_FILE"
 }
@@ -391,15 +412,35 @@ topology_fingerprint() {
 	rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
 	printf '%s\n' "$rules" |
 		awk '{
+			if ($0 ~ /^[[:space:]]*quota[[:space:]]+q_[^[:space:]]+[[:space:]]+\{$/)
+				in_quota = 1
 			gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>")
-			gsub(/used [0-9]+ bytes/, "used <runtime> bytes")
+			# nft omits "used 0 bytes" but prints it after consumption. Remove
+			# that optional suffix only from a quota value line; every other
+			# occurrence remains part of the owned topology fingerprint.
+			if (in_quota && $0 ~ /^[[:space:]]*[0-9]+ bytes used [0-9]+ bytes[[:space:]]*$/)
+				sub(/ used [0-9]+ bytes[[:space:]]*$/, "")
 			print
+			if (in_quota && $0 ~ /^[[:space:]]*\}[[:space:]]*$/)
+				in_quota = 0
 		}' |
 		sha256sum | awk '{ print $1 }'
 }
 
+migration_hold_classifier_ok() {
+	local rules
+	[ "$migration_active" = '1' ] || return 0
+	rules="$(nft list chain "$TABLE_FAMILY" "$TABLE_NAME" account 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" |
+		grep -F "iifname \"$lan_if\" oifname \"$wan_if\" ip saddr $subnet ip saddr != @priority_v4" |
+		grep -Fq "meta priority set $WAN_HANDLE:20 return" || return 1
+	printf '%s\n' "$rules" |
+		grep -F "iifname \"$wan_if\" oifname \"$lan_if\" ip daddr $subnet ip daddr != @priority_v4" |
+		grep -Fq "meta priority set $LAN_HANDLE:20 return"
+}
+
 expected_topology_fingerprint() {
-	local tab id mac ip name classid=101 slowid expected
+	local tab id mac ip name limit classid=101 slowid expected
 	tab="$(printf '\t')"
 	expected="$({
 		printf 'table %s %s {\n' "$TABLE_FAMILY" "$TABLE_NAME"
@@ -409,13 +450,16 @@ expected_topology_fingerprint() {
 		done
 		while IFS="$tab" read -r id mac ip name; do
 			[ -z "$id" ] && continue
-			printf '\tquota q_%s {\n\t\t%s bytes used <runtime> bytes\n\t}\n\n' "$id" "$quota_bytes"
+			resolve_device_policy "$id" "$mac" || return 1
+			limit="$POLICY_LIMIT_BYTES"
+			printf '\tquota q_%s {\n\t\t%s bytes\n\t}\n\n' "$id" "$limit"
 		done < "$DEVICES_FILE"
 		printf '\tset priority_v4 {\n\t\ttype ipv4_addr\n\t\telements = { %s }\n\t}\n\n' "$PRIORITY_SET"
 		printf '\tchain account {\n'
 		printf '\t\ttype filter hook forward priority filter - 6; policy accept;\n'
 		printf '\t\tiifname "%s" oifname "%s" ip saddr @priority_v4 counter name "internet_up" counter name "priority_up" return\n' "$lan_if" "$wan_if"
 		printf '\t\tiifname "%s" oifname "%s" ip saddr %s ip saddr != @priority_v4 counter name "internet_up" counter name "others_up"\n' "$lan_if" "$wan_if" "$subnet"
+		[ "$migration_active" != '1' ] || printf '\t\tiifname "%s" oifname "%s" ip saddr %s ip saddr != @priority_v4 meta priority set %s:20 return\n' "$lan_if" "$wan_if" "$subnet" "$WAN_HANDLE"
 		while IFS="$tab" read -r id mac ip name; do
 			[ -z "$id" ] && continue
 			slowid=$((classid + SLOW_OFFSET))
@@ -425,6 +469,7 @@ expected_topology_fingerprint() {
 		done < "$DEVICES_FILE"
 		printf '\t\tiifname "%s" oifname "%s" ip daddr @priority_v4 counter name "internet_down" counter name "priority_down" return\n' "$wan_if" "$lan_if"
 		printf '\t\tiifname "%s" oifname "%s" ip daddr %s ip daddr != @priority_v4 counter name "internet_down" counter name "others_down"\n' "$wan_if" "$lan_if" "$subnet"
+		[ "$migration_active" != '1' ] || printf '\t\tiifname "%s" oifname "%s" ip daddr %s ip daddr != @priority_v4 meta priority set %s:20 return\n' "$wan_if" "$lan_if" "$subnet" "$LAN_HANDLE"
 		classid=101
 		while IFS="$tab" read -r id mac ip name; do
 			[ -z "$id" ] && continue
@@ -439,17 +484,20 @@ expected_topology_fingerprint() {
 }
 
 verify_runtime() {
-	local ruleset current_wan tab id mac ip name actual expected current
+	local ruleset current_wan tab id mac ip name actual limit expected current
 	current_wan="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	[ "$current_wan" = "$wan_if" ] || return 1
 	expected="$(expected_topology_fingerprint)" || return 1
 	current="$(topology_fingerprint)" || return 1
 	[ -n "$expected" ] && [ "$current" = "$expected" ] || return 1
+	migration_hold_classifier_ok || return 1
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip name; do
 		[ -z "$id" ] && continue
+		resolve_device_policy "$id" "$mac" || return 1
+		limit="$POLICY_LIMIT_BYTES"
 		actual="$(quota_bytes_for "$id")" || return 1
-		[ "$actual" = "$quota_bytes" ] || return 1
+		[ "$actual" = "$limit" ] || return 1
 	done < "$DEVICES_FILE"
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = '0' ] || return 1
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = '0' ] || return 1
@@ -463,7 +511,8 @@ zero_current_devices() {
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip name; do
 		[ -z "$id" ] && continue
-		printf '%s\t%s\t%s\t%s\t0\n' "$id" "$mac" "$ip" "$name" >> "$CURRENT_FILE.tmp" || return 1
+		resolve_device_policy "$id" "$mac" || return 1
+		printf '%s\t%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$POLICY_LIMIT_BYTES" "$POLICY_BONUS_BYTES" "$POLICY_DOWN_KBIT" "$POLICY_UP_KBIT" >> "$CURRENT_FILE.tmp" || return 1
 	done < "$DEVICES_FILE"
 	mv "$CURRENT_FILE.tmp" "$CURRENT_FILE"
 	device_total_used=0
@@ -471,7 +520,7 @@ zero_current_devices() {
 }
 
 persist_values() {
-	local tmp="$STATE_FILE.tmp" key expected saved tab id mac ip name used reserved file
+	local tmp="$STATE_FILE.tmp" key expected saved tab id mac ip name used limit bonus down up file
 	mkdir -p -m 0700 "$STATE_DIR" "$DEVICE_STATE_DIR" || return 1
 	[ ! -L "$STATE_DIR" ] && [ ! -L "$DEVICE_STATE_DIR" ] || return 1
 	umask 077
@@ -490,20 +539,21 @@ persist_values() {
 		[ "$saved" = "$expected" ] || return 1
 	done
 	tab="$(printf '\t')"
-	while IFS="$tab" read -r id mac ip name used; do
+	while IFS="$tab" read -r id mac ip name used limit bonus down up; do
 		[ -z "$id" ] && continue
-		valid_id "$id" && is_uint "$used" || return 1
+		valid_id "$id" && is_uint "$used" && is_uint "$limit" || return 1
 		file="$DEVICE_STATE_DIR/$id"
 		[ ! -L "$file" ] || return 1
-		reserved="$(awk -v u="$used" -v s="$persist_step" -v g="$recovery_guard_bytes" -v q="$quota_bytes" 'BEGIN { n=u+s+g; if (n>q) n=q; printf "%.0f", n }')"
 		{
 			printf 'day=%s\n' "$period_day"
 			printf 'mac=%s\n' "$mac"
 			printf 'used=%s\n' "$used"
-			printf 'reserved=%s\n' "$reserved"
+			# Kept for downgrade compatibility, but deliberately equals the exact
+			# checkpoint so a restart cannot manufacture consumption.
+			printf 'reserved=%s\n' "$used"
 		} > "$file.tmp" && mv "$file.tmp" "$file" || return 1
 		[ "$(sed -n 's/^used=//p' "$file" | sed -n '1p')" = "$used" ] || return 1
-		[ "$(sed -n 's/^reserved=//p' "$file" | sed -n '1p')" = "$reserved" ] || return 1
+		[ "$(sed -n 's/^reserved=//p' "$file" | sed -n '1p')" = "$used" ] || return 1
 	done < "$CURRENT_FILE"
 	sync || return 1
 	last_persist_epoch="$(date +%s)"
@@ -529,7 +579,7 @@ ensure_offloading_disabled() {
 }
 
 install_table() {
-	local replace='' tab id mac ip name used classid=101 slowid
+	local replace='' tab id mac ip name used limit classid=101 slowid
 	if nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
 		accounting_table_owned || return 1
 		replace="delete table $TABLE_FAMILY $TABLE_NAME"
@@ -548,13 +598,16 @@ install_table() {
 		tab="$(printf '\t')"
 		while IFS="$tab" read -r id mac ip name; do
 			[ -z "$id" ] && continue
-			used="$(device_saved_used "$id")"
-			printf '\tquota q_%s { %s bytes used %s bytes; }\n' "$id" "$quota_bytes" "$used"
+			resolve_device_policy "$id" "$mac" || return 1
+			limit="$POLICY_LIMIT_BYTES"
+			used="$(device_saved_used "$id" "$limit")"
+			printf '\tquota q_%s { %s bytes used %s bytes; }\n' "$id" "$limit" "$used"
 		done < "$DEVICES_FILE"
 		printf '\tchain account {\n'
 		printf '\t\ttype filter hook forward priority -6; policy accept;\n'
 		printf '\t\tiifname "%s" oifname "%s" ip saddr @priority_v4 counter name internet_up counter name priority_up return\n' "$lan_if" "$wan_if"
 		printf '\t\tiifname "%s" oifname "%s" ip saddr %s ip saddr != @priority_v4 counter name internet_up counter name others_up\n' "$lan_if" "$wan_if" "$subnet"
+		[ "$migration_active" != '1' ] || printf '\t\tiifname "%s" oifname "%s" ip saddr %s ip saddr != @priority_v4 meta priority set %s:20 return\n' "$lan_if" "$wan_if" "$subnet" "$WAN_HANDLE"
 		classid=101
 		while IFS="$tab" read -r id mac ip name; do
 			[ -z "$id" ] && continue
@@ -565,6 +618,7 @@ install_table() {
 		done < "$DEVICES_FILE"
 		printf '\t\tiifname "%s" oifname "%s" ip daddr @priority_v4 counter name internet_down counter name priority_down return\n' "$wan_if" "$lan_if"
 		printf '\t\tiifname "%s" oifname "%s" ip daddr %s ip daddr != @priority_v4 counter name internet_down counter name others_down\n' "$wan_if" "$lan_if" "$subnet"
+		[ "$migration_active" != '1' ] || printf '\t\tiifname "%s" oifname "%s" ip daddr %s ip daddr != @priority_v4 meta priority set %s:20 return\n' "$wan_if" "$lan_if" "$subnet" "$LAN_HANDLE"
 		classid=101
 		while IFS="$tab" read -r id mac ip name; do
 			[ -z "$id" ] && continue
@@ -581,8 +635,68 @@ accounting_table_owned() {
 	nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | grep -Fq "comment \"$OWNER_COMMENT\""
 }
 
+reset_threshold_reached_for_day() {
+	local target_day="$1" now_day now_hour now_minute
+	now_day="$(date +%F)"
+	case "$now_day:$target_day" in
+		[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]:[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+		*) return 1 ;;
+	esac
+	[ "$now_day" \> "$target_day" ] && return 0
+	[ "$now_day" = "$target_day" ] || return 1
+	now_hour="$(date +%H)"; now_minute="$(date +%M)"
+	now_hour="${now_hour#0}"; now_minute="${now_minute#0}"
+	[ -n "$now_hour" ] || now_hour=0; [ -n "$now_minute" ] || now_minute=0
+	now_minute=$((now_hour * 60 + now_minute))
+	[ "$now_minute" -ge "$reset_at_minute" ]
+}
+
+complete_period_reset() {
+	local target_day="$1" name releasing_migration=0
+	write_runtime applying 'Reiniciando de forma durable el periodo diario.' || return 1
+	period_day="$target_day"
+	for name in internet_up internet_down priority_up priority_down others_up others_down; do eval "$name=0"; done
+	deliberate_daily_reset=1
+	[ "$migration_active" = '1' ] && [ -n "$migration_marker_day" ] && releasing_migration=1
+	rm -f "$LIVE_SEEDS_FILE" "$LIVE_SEEDS_FILE.tmp" || return 1
+	# Replace first while an identity-unknown hold remains active. If the nft
+	# transaction fails, the marker and old durable state remain authoritative.
+	live_table_present=0
+	install_table || return 1
+	read_counters || return 1
+	verify_runtime || return 1
+	verified_at="$(date +%s)"
+	last_verify_epoch="$verified_at"
+	# Replace every inherited device checkpoint with a verified exact zero while
+	# the migration marker still exists. The marker is removed last, so any
+	# interrupted transition restarts fail-closed and cannot restore old values.
+	rm -rf "$DEVICE_STATE_DIR" || return 1
+	persist_values || return 1
+	persist_table_ids || return 1
+	if [ "$releasing_migration" = '1' ]; then
+		# Only after exact-v1 zero is durable may the aggregate hold be replaced by
+		# the normal per-device classifier. Keep the marker through its readback so
+		# an interrupted transition re-enters the hold on respawn.
+		migration_active=0
+		live_table_present=0
+		install_table || return 1
+		read_counters || return 1
+		verify_runtime || return 1
+		verified_at="$(date +%s)"
+		last_verify_epoch="$verified_at"
+	fi
+	write_current_snapshot || return 1
+	rm -f "$MIGRATION_FILE" || return 1
+	sync || return 1
+	migration_marker_day=''
+	migration_active=0
+	deliberate_daily_reset=0
+	force_degraded=0
+	live_table_present=1
+}
+
 reset_period_if_due() {
-	local now_day now_hour now_minute name
+	local now_day now_hour now_minute target_day=''
 	now_day="$(date +%F)"
 	if [ -z "$period_day" ]; then
 		case "$now_day" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) period_day="$now_day" ;; *) return 1 ;; esac
@@ -598,25 +712,15 @@ reset_period_if_due() {
 	now_minute=$((now_hour * 60 + now_minute))
 	# ISO dates sort chronologically. Never reset backwards while pre-NTP time is
 	# older than the durable period.
-	[ "$now_day" \> "$period_day" ] && [ "$now_minute" -ge "$reset_at_minute" ] || return 0
-	write_runtime applying 'Reiniciando de forma durable el periodo diario.' || return 1
-	period_day="$now_day"
-	for name in internet_up internet_down priority_up priority_down others_up others_down; do eval "$name=0"; done
-	deliberate_daily_reset=1
-	# Replace first. If the nft transaction fails, the old durable day remains
-	# authoritative and respawn retries instead of committing a false zero.
-	live_table_present=0
-	install_table || return 1
-	read_counters || return 1
-	verify_runtime || return 1
-	verified_at="$(date +%s)"
-	last_verify_epoch="$verified_at"
-	write_current_snapshot || return 1
-	rm -rf "$DEVICE_STATE_DIR" || return 1
-	rm -f "$MIGRATION_FILE" || return 1
-	migration_active=0; migration_seed=0
-	persist_values || return 1
-	deliberate_daily_reset=0
+	if [ "$now_day" \> "$period_day" ] && [ "$now_minute" -ge "$reset_at_minute" ]; then
+		target_day="$now_day"
+	elif [ "$migration_active" = '1' ] && [ -n "$migration_marker_day" ] && [ "$period_day" \> "$migration_marker_day" ] && reset_threshold_reached_for_day "$period_day"; then
+		# Recovery from an interrupted reset: the durable period advanced while
+		# the marker survived. Rebuild that period from verified zero before release.
+		target_day="$period_day"
+	fi
+	[ -n "$target_day" ] || return 0
+	complete_period_reset "$target_day"
 }
 
 handle_persist_failure() {
@@ -627,7 +731,9 @@ handle_persist_failure() {
 }
 
 update_runtime_message() {
-	if [ "$degraded_count" -gt 0 ]; then
+	if [ "$migration_active" = '1' ]; then
+		write_runtime active 'Migración sin identidad histórica: Otros permanece a 64 Kbit/s hasta el próximo reset diario.'
+	elif [ "$degraded_count" -gt 0 ]; then
 		write_runtime active "$degraded_count dispositivo(s) agotaron su cuota y están limitados a 64 Kbit/s."
 	else
 		write_runtime active 'Contabilidad diaria individual verificada.'
@@ -664,15 +770,19 @@ main() {
 	inspect_previous_session || { write_runtime error 'El marcador de persistencia no es seguro.'; exit 1; }
 	inspect_boot || { write_runtime error 'No se pudo verificar la identidad del arranque.'; exit 1; }
 	load_saved_counters
+	# Resolve the accounting day before inspecting any inherited per-device nft
+	# object. This lets the durable migration marker suppress those reads.
+	if [ -z "$period_day" ]; then
+		period_day="$(date +%F)"
+		case "$period_day" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) write_runtime error 'No se pudo resolver el periodo diario.'; exit 1 ;; esac
+	fi
+	load_migration_hold || { write_runtime error 'El estado preventivo de migración no es válido.'; exit 1; }
 	inspect_existing_table || { write_runtime error 'Existe una tabla de contabilidad sin la firma propia; no se tocó.'; exit 1; }
 	merge_live_counters || { write_runtime error 'No se pudieron recuperar los contadores de la tabla anterior.'; exit 1; }
 	snapshot_live_quotas || { write_runtime error 'No se pudieron recuperar las cuotas de la tabla anterior.'; exit 1; }
 	ensure_offloading_disabled || { write_runtime error 'No se pudo desactivar flow offloading.'; exit 1; }
 	inspect_existing_table || { write_runtime error 'Existe una tabla de contabilidad sin la firma propia; no se tocó.'; exit 1; }
 	reset_period_if_due || { write_runtime error 'No se pudo iniciar el periodo diario.'; exit 1; }
-	# period_day must be resolved before validating the migration seed. The seed
-	# still takes precedence over a deliberate daily reset.
-	load_migration_seed
 	mark_runtime_dirty || { write_runtime error 'No se pudo abrir una sesión durable de contabilidad.'; exit 1; }
 	install_table || { write_runtime error 'No se pudo instalar la contabilidad individual.'; exit 1; }
 	deliberate_daily_reset=0
@@ -683,10 +793,6 @@ main() {
 	persist_values || { handle_persist_failure; exit 1; }
 	persist_table_ids || { handle_persist_failure; exit 1; }
 	persist_boot_id || { handle_persist_failure; exit 1; }
-	if [ "$migration_active" = '1' ]; then
-		rm -f "$MIGRATION_FILE" && sync || { handle_persist_failure; exit 1; }
-		migration_active=0
-	fi
 	rm -f "$HANDOFF_FILE" "$LIVE_SEEDS_FILE"
 	trap cleanup TERM INT
 	last_persist_epoch="$(date +%s)"

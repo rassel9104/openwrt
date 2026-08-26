@@ -1,0 +1,78 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+# Shared, read-only resolver for per-device policy. Callers must config_load
+# bwlimit first. A bonus applies only to its recorded accounting day; speed
+# overrides remain active until the owner explicitly clears them.
+
+POLICY_MAX_BYTES=1000000000000
+
+policy_is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+policy_uint_ge() {
+	awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+policy_valid_id() {
+	case "$1" in
+		????????????) case "$1" in *[!0-9a-f]*) return 1 ;; *) return 0 ;; esac ;;
+		*) return 1 ;;
+	esac
+}
+
+policy_section_for() {
+	policy_valid_id "$1" || return 1
+	printf 'device_%s' "$1"
+}
+
+load_device_policy() {
+	local id="$1" mac="$2" day="$3" base_quota="$4" base_down="$5" base_up="$6"
+	local total_down="$7" total_up="$8" degraded="$9" section type saved_id saved_mac value
+	local bonus_day bonus_bytes custom_down custom_up max_bonus
+
+	policy_valid_id "$id" || return 1
+	case "$mac" in ??\:??\:??\:??\:??\:??) ;; *) return 1 ;; esac
+	case "$day" in ????-??-??) ;; *) return 1 ;; esac
+	for value in "$base_quota" "$base_down" "$base_up" "$total_down" "$total_up" "$degraded"; do
+		policy_is_uint "$value" || return 1
+	done
+
+	POLICY_BONUS_BYTES=0
+	POLICY_LIMIT_BYTES="$base_quota"
+	POLICY_DOWN_KBIT="$base_down"
+	POLICY_UP_KBIT="$base_up"
+	section="$(policy_section_for "$id")" || return 1
+	type="$(uci -q get "bwlimit.$section")"
+	[ -n "$type" ] || return 0
+	[ "$type" = 'device' ] || return 1
+	saved_id="$(uci -q get "bwlimit.$section.device_id")"
+	saved_mac="$(uci -q get "bwlimit.$section.mac")"
+	[ "$saved_id" = "$id" ] && [ "$saved_mac" = "$mac" ] || return 1
+
+	bonus_day="$(uci -q get "bwlimit.$section.bonus_day")"
+	bonus_bytes="$(uci -q get "bwlimit.$section.bonus_bytes")"
+	if [ -n "$bonus_day$bonus_bytes" ]; then
+		case "$bonus_day" in ????-??-??) ;; *) return 1 ;; esac
+		policy_is_uint "$bonus_bytes" || return 1
+		if [ "$bonus_day" = "$day" ]; then
+			max_bonus="$(awk -v m="$POLICY_MAX_BYTES" -v q="$base_quota" 'BEGIN { printf "%.0f", m-q }')"
+			policy_uint_ge "$max_bonus" "$bonus_bytes" || return 1
+			POLICY_BONUS_BYTES="$bonus_bytes"
+			POLICY_LIMIT_BYTES="$(awk -v q="$base_quota" -v b="$bonus_bytes" 'BEGIN { printf "%.0f", q+b }')"
+		fi
+	fi
+
+	custom_down="$(uci -q get "bwlimit.$section.down_kbit")"
+	if [ -n "$custom_down" ]; then
+		policy_is_uint "$custom_down" && policy_uint_ge "$custom_down" "$degraded" && policy_uint_ge "$total_down" "$custom_down" || return 1
+		POLICY_DOWN_KBIT="$custom_down"
+	fi
+	custom_up="$(uci -q get "bwlimit.$section.up_kbit")"
+	if [ -n "$custom_up" ]; then
+		policy_is_uint "$custom_up" && policy_uint_ge "$custom_up" "$degraded" && policy_uint_ge "$total_up" "$custom_up" || return 1
+		POLICY_UP_KBIT="$custom_up"
+	fi
+}

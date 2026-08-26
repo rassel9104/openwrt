@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.nano-monitor": [ "start", "set_quota" ]
+				"luci.nano-monitor": [ "start", "set_quota", "set_device_policy" ]
 			},
 			"uci": [ "nano-monitor" ]
 		}

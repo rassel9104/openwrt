@@ -2,28 +2,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
-# Las configuraciones son conffiles: la migración v4 sustituye la cuota grupal
-# por cuota y techo estrictos por cada dispositivo de Otros.
-is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# Las configuraciones son conffiles: v4 sustituyó la cuota grupal por cuotas
+# individuales; v5 elimina reservas hipotéticas acumulables y admite ajustes.
 
 write_v4_migration() {
-	local state='/etc/nano-monitor/daily-state' marker='/etc/nano-monitor/v4-migration' day up down used quota='700000000'
+	local state='/etc/nano-monitor/daily-state' marker='/etc/nano-monitor/v4-migration' day
 	day="$(sed -n 's/^day=//p' "$state" 2>/dev/null | sed -n '1p')"
-	up="$(sed -n 's/^others_up=//p' "$state" 2>/dev/null | sed -n '1p')"
-	down="$(sed -n 's/^others_down=//p' "$state" 2>/dev/null | sed -n '1p')"
-	if is_uint "$up" && is_uint "$down"; then
-		used="$(awk -v a="$up" -v b="$down" -v q="$quota" 'BEGIN { n=a+b; if (n>q) n=q; printf "%.0f", n }')"
-	else
-		# Sin estado fiable no se concede una cuota nueva a mitad del día.
-		day="$(date +%F)"; used="$quota"
-	fi
-	case "$day" in ????-??-??) ;; *) day="$(date +%F)"; used="$quota" ;; esac
+	case "$day" in ????-??-??) ;; *) day="$(date +%F)" ;; esac
 	mkdir -p -m 0700 /etc/nano-monitor || return 1
+	[ ! -L /etc/nano-monitor ] && [ ! -L "$marker" ] && [ ! -L "$marker.tmp" ] || return 1
+	rm -f "$marker.tmp" || return 1
 	umask 077
+	# El estado grupal anterior no contiene una relación MAC→consumo. Mantener
+	# Otros en el perfil preventivo hasta el reset conserva servicio a 64 Kbit/s
+	# sin inventar consumo individual ni conceder cuotas nuevas a mitad del día.
 	{
 		printf 'day=%s\n' "$day"
-		printf 'used=%s\n' "$used"
-	} > "$marker.tmp" && mv "$marker.tmp" "$marker"
+		printf 'mode=identity-unknown-hold\n'
+	} > "$marker.tmp" && mv "$marker.tmp" "$marker" && sync || return 1
+	[ "$(sed -n 's/^day=//p' "$marker" | sed -n '1p')" = "$day" ] &&
+		[ "$(sed -n 's/^mode=//p' "$marker" | sed -n '1p')" = 'identity-unknown-hold' ]
 }
 
 legacy_bwlimit_script_owned() {
@@ -41,13 +39,18 @@ legacy_bwlimit_table_owned() {
 	printf '%s\n' "$rules" | grep -F "oifname \"$lan\" ip daddr $subnet" | grep -Fq 'limit rate over'
 }
 
-migrated_from_legacy=0
-needs_v4_migration=0
+needs_identity_hold=0
 if uci -q get bwlimit.main >/dev/null; then
 	previous_schema="$(uci -q get bwlimit.main.schema_version)"
+	checkpoint_model="$(uci -q get bwlimit.main.accounting_checkpoint_model)"
+	# r15 podía avanzar a schema 5 desde schema 4 sin crear el marcador. La
+	# ausencia del modelo exact-v1 identifica también esa transición incompleta.
+	# En ambos casos los checkpoints por dispositivo son no autoritativos.
+	if [ "$previous_schema" != '5' ] || [ "$checkpoint_model" != 'exact-v1' ]; then
+		needs_identity_hold=1
+	fi
 	[ -n "$(uci -q get bwlimit.main.wan_network)" ] || uci -q set bwlimit.main.wan_network='provider'
-	if [ "$previous_schema" != '3' ] && [ "$previous_schema" != '4' ]; then
-		migrated_from_legacy=1
+	if [ "$previous_schema" != '3' ] && [ "$previous_schema" != '4' ] && [ "$previous_schema" != '5' ]; then
 		uci -q set bwlimit.main.total_down_kbit='8800'
 		uci -q set bwlimit.main.total_up_kbit='4200'
 		uci -q delete bwlimit.main.exempt_ip
@@ -57,8 +60,7 @@ if uci -q get bwlimit.main >/dev/null; then
 		[ -n "$(uci -q get bwlimit.main.total_down_kbit)" ] || uci -q set bwlimit.main.total_down_kbit='8800'
 		[ -n "$(uci -q get bwlimit.main.total_up_kbit)" ] || uci -q set bwlimit.main.total_up_kbit='4200'
 	fi
-	if [ "$previous_schema" != '4' ]; then
-		needs_v4_migration=1
+	if [ "$previous_schema" != '4' ] && [ "$previous_schema" != '5' ]; then
 		uci -q set bwlimit.main.other_down_kbit='768'
 		uci -q set bwlimit.main.other_up_kbit='128'
 		uci -q set bwlimit.main.other_degraded_kbit='64'
@@ -79,11 +81,17 @@ if uci -q get bwlimit.main >/dev/null; then
 	[ -n "$(uci -q get bwlimit.main.quota_reset_minute)" ] || uci -q set bwlimit.main.quota_reset_minute='1'
 	[ -n "$(uci -q get bwlimit.main.quota_persist_interval)" ] || uci -q set bwlimit.main.quota_persist_interval='1800'
 	[ -n "$(uci -q get bwlimit.main.quota_persist_step_bytes)" ] || uci -q set bwlimit.main.quota_persist_step_bytes='64000000'
-	# El seed durable se confirma antes de avanzar schema_version. Si el commit
-	# falla, el reintento vuelve a escribir el mismo seed y completa la transición.
-	[ "$needs_v4_migration" = '0' ] || write_v4_migration || exit 1
-	uci -q set bwlimit.main.schema_version='4' || exit 1
-	uci -q commit bwlimit || { uci -q revert bwlimit.main.schema_version; exit 1; }
+	# El hold durable se confirma antes de declarar el modelo exacto. Durante el
+	# hold el daemon ignora todos los checkpoints por dispositivo y sólo los
+	# sustituye por ceros después de verificar la tabla preventiva.
+	[ "$needs_identity_hold" = '0' ] || write_v4_migration || exit 1
+	uci -q set bwlimit.main.schema_version='5' || exit 1
+	uci -q set bwlimit.main.accounting_checkpoint_model='exact-v1' || exit 1
+	uci -q commit bwlimit || {
+		uci -q revert bwlimit.main.schema_version
+		uci -q revert bwlimit.main.accounting_checkpoint_model
+		exit 1
+	}
 fi
 
 # La contabilidad diaria se calcula explícitamente en la zona del propietario.
