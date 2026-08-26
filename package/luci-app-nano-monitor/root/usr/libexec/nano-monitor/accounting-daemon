@@ -208,6 +208,8 @@ inspect_boot() {
 		saved="$(sed -n '1p' "$BOOT_FILE")"
 		[ "$saved" = "$current_boot_id" ] && boot_changed=0
 	fi
+	# A changed boot ID is expected after a reboot, not an inspection failure.
+	return 0
 }
 
 inspect_existing_table() {
