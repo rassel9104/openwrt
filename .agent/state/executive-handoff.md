@@ -25,14 +25,14 @@ last_updated: 2026-08-25
 - Pasaron sintaxis shell/JavaScript, JSON, `git diff --check`, build OpenWrt y revisión focalizada final `PASS`.
 - `recovery-kit/` continúa local, excluido de Git y no debe publicarse.
 - Commit local creado con el mensaje `luci: add daily accounting and safe bandwidth shaping`.
+- Fork público creado en `https://github.com/rassel9104/openwrt` y rama publicada como `fork/nano-m5-upper-5ghz`.
 
 ## Open decision / acceptance boundary
 - No quedan decisiones de producto o visuales abiertas para esta entrega.
-- El push a `origin` falló con HTTP 403: el remoto es `openwrt/openwrt` y la cuenta autenticada no tiene permiso.
-- No existe actualmente el fork `rassel9104/openwrt`; falta autorización para crearlo públicamente o la URL de otro remoto escribible.
+- La entrega está publicada; no quedan bloqueos abiertos.
 
 ## Next safe action
-- Resolver el destino Git escribible y publicar la rama sin reescribir historial.
+- Ninguna acción requerida para esta entrega.
 
 ## Active references
 - `package/luci-app-nano-monitor/`

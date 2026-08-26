@@ -11,8 +11,8 @@
 ## Next
 - [x] Superficie exacta revisada sin secretos ni artefactos locales.
 - [x] Commit único local creado.
-- [ ] Obtener autorización para crear el fork público `rassel9104/openwrt` o recibir otro remoto escribible.
-- [ ] Hacer push de `nano-m5-upper-5ghz` y comunicar destino final.
+- [x] Fork público `rassel9104/openwrt` creado con autorización del owner.
+- [x] Rama `nano-m5-upper-5ghz` publicada y configurada para seguir `fork/nano-m5-upper-5ghz`.
 
 ## Waiting / parked
-- [ ] Push bloqueado: `origin` apunta a `openwrt/openwrt` y respondió HTTP 403.
+- [ ] Ninguno para esta entrega.
