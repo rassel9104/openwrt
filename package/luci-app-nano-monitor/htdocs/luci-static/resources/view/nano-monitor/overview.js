@@ -40,6 +40,31 @@ var callSetQuota = rpc.declare({
 	expect: { '': {} }
 });
 
+var statusEpoch = 0;
+var statusActions = 0;
+var accountingEpoch = 0;
+var accountingActions = 0;
+
+function beginStatusAction() {
+	statusActions++;
+	statusEpoch++;
+}
+
+function endStatusAction() {
+	statusActions = Math.max(0, statusActions - 1);
+	statusEpoch++;
+}
+
+function beginAccountingAction() {
+	accountingActions++;
+	accountingEpoch++;
+}
+
+function endAccountingAction() {
+	accountingActions = Math.max(0, accountingActions - 1);
+	accountingEpoch++;
+}
+
 function setText(id, text) {
 	var node = document.getElementById(id);
 	if (node)
@@ -186,6 +211,7 @@ function applyQuota(button) {
 	}
 	if (button)
 		button.disabled = true;
+	beginAccountingAction();
 	return callSetQuota(quota).then(function(result) {
 		if (result.verified !== '1')
 			throw new Error(result.error || 'La cuota no superó el readback.');
@@ -195,30 +221,34 @@ function applyQuota(button) {
 		ui.addNotification(null, E('p', {}, error.message || 'No se pudo aplicar la cuota.'), 'error');
 		return L.resolveDefault(callAccounting(), {}).then(renderAccounting);
 	}).finally(function() {
+		endAccountingAction();
 		if (button)
 			button.disabled = false;
 	});
 }
 
 function refreshAll() {
+	var currentStatusEpoch = statusEpoch;
+	var currentAccountingEpoch = accountingEpoch;
 	return Promise.all([
-		L.resolveDefault(callStatus(), {}),
-		L.resolveDefault(callAccounting(), {}),
-		L.resolveDefault(callShaper(), {})
-	]).then(function(data) {
-		renderStatus(data[0]);
-		renderAccounting(data[1]);
-		renderShaper(data[2]);
-	});
+		L.resolveDefault(callStatus(), {}).then(function(response) {
+			if (!statusActions && currentStatusEpoch === statusEpoch)
+				renderStatus(response);
+		}),
+		L.resolveDefault(callAccounting(), {}).then(function(response) {
+			if (!accountingActions && currentAccountingEpoch === accountingEpoch)
+				renderAccounting(response);
+		}),
+		L.resolveDefault(callShaper(), {}).then(renderShaper)
+	]);
 }
 
 return view.extend({
 	load: function() {
-		return Promise.all([
-			L.resolveDefault(callStatus(), {}),
-			L.resolveDefault(callAccounting(), {}),
-			L.resolveDefault(callShaper(), {})
-		]);
+		// Keep initial navigation independent from the comparatively expensive
+		// nftables/tc readback on low-memory MIPS hardware. Live values populate
+		// immediately after the view is visible.
+		return L.resolveDefault(callStatus(), {});
 	},
 
 	render: function(initial) {
@@ -241,6 +271,7 @@ return view.extend({
 			var button = ev && ev.currentTarget;
 			if (button)
 				button.setAttribute('data-nano-start', '1');
+			beginStatusAction();
 			return this.map.save().then(callStart).then(function(result) {
 				if (result.ok !== '1')
 					throw new Error(result.error || 'No se pudo iniciar la prueba.');
@@ -248,6 +279,8 @@ return view.extend({
 				ui.addNotification(null, E('p', {}, 'Prueba iniciada; descarga y subida se ejecutarán de forma secuencial.'), 'info');
 			}).catch(function(error) {
 				ui.addNotification(null, E('p', {}, error.message), 'error');
+			}).finally(function() {
+				endStatusAction();
 			});
 		};
 
@@ -300,10 +333,10 @@ return view.extend({
 				var startButton = formNode.querySelector('.cbi-button-apply');
 				if (startButton)
 					startButton.setAttribute('data-nano-start', '1');
-				renderStatus(initial[0]);
-				renderAccounting(initial[1]);
-				renderShaper(initial[2]);
-				poll.add(refreshAll, 10);
+				renderStatus(initial);
+				// poll.add() performs the first refresh immediately. A daily dashboard
+				// does not need deep nftables/tc verification every ten seconds.
+				poll.add(refreshAll, 30);
 			}, 0);
 			return E([ formNode, dashboard ]);
 		});
