@@ -233,6 +233,10 @@ table $TABLE_FAMILY $TABLE_NAME {
 		iifname "$lan_if" oifname "$wan_if" ip saddr @priority_v4 counter meta priority set $WAN_HANDLE:10 return
 		iifname "$wan_if" oifname "$lan_if" ip daddr @priority_v4 counter meta priority set $LAN_HANDLE:10 return
 	}
+	chain local_output {
+		type filter hook output priority mangle; policy accept;
+		oifname "$lan_if" counter meta priority set $LAN_HANDLE:10 return
+	}
 }
 EOF
 }
@@ -305,6 +309,13 @@ verify_tree() {
 
 classifier_owned() {
 	nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | grep -Fq "comment \"$OWNER_COMMENT\""
+}
+
+local_output_classifier_ok() {
+	local rules
+	rules="$(nft list chain "$TABLE_FAMILY" "$TABLE_NAME" local_output 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" | grep -Fq 'type filter hook output priority mangle; policy accept;' || return 1
+	printf '%s\n' "$rules" | grep -F "oifname \"$lan_if\"" | grep -Fq "meta priority set $LAN_HANDLE:10 return"
 }
 
 legacy_classifier_owned() {
@@ -502,7 +513,8 @@ activate_safe_fallback() {
 	install_classifier || return 1
 	created_classifier=1
 	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$degraded_kbit" &&
-		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$degraded_kbit" || return 1
+		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$degraded_kbit" &&
+		local_output_classifier_ok || return 1
 	[ "$require_accounting" != '1' ] || accounting_classifier_ok || return 1
 	write_applied_snapshot safe_fallback || return 1
 	remove_gate || return 1
@@ -582,7 +594,7 @@ start_service() {
 	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$other_down_kbit" || { fail_after_clear 'Falló el árbol HTB de descarga.'; return 1; }
 	install_classifier || { fail_after_clear 'Falló el clasificador prioritario.'; return 1; }
 	created_classifier=1
-	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$other_up_kbit" && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$other_down_kbit" && accounting_classifier_ok || { fail_after_clear 'Falló el readback del límite individual.'; return 1; }
+	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$other_up_kbit" && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$other_down_kbit" && accounting_classifier_ok && local_output_classifier_ok || { fail_after_clear 'Falló el readback del límite individual o del acceso local al router.'; return 1; }
 	remove_gate || { write_failure_state 'El shaping quedó instalado, pero la protección transitoria no pudo retirarse.'; return 1; }
 	write_applied_snapshot last_apply || { write_failure_state 'El shaping quedó instalado, pero no se pudo publicar su manifiesto aplicado.'; return 1; }
 	printf '%s\n' active > "$STATE_DIR/owned"
