@@ -3,7 +3,7 @@
 > Max 2 KB. Preserve only current direction, not history.
 
 ## Now
-- [x] Nano Monitor 1.4.0-r5 compilado, instalado y verificado.
+- [x] Nano Monitor 1.4.0-r13 compilado, instalado y verificado.
 - [x] Cuotas individuales, RPC, hotplug, servicios y UI validados técnicamente.
 - [x] Shaping y contabilidad activos, verificados y habilitados al arranque.
 - [x] Redmi Note 13 recibe la reserva estática `192.168.1.59` y queda prioritario.
@@ -15,7 +15,9 @@
 - [x] Rama `nano-m5-upper-5ghz` publicada en el fork autorizado.
 - [x] Reparación de reinicio publicada en `0fa7cabea6e`.
 - [x] Carga inicial diferida y polling reducido publicados en `6c9f4cbb823`; revisión independiente final `PASS`.
+- [x] RPC rápidos mediante snapshots, topología canónica, fallback explícito y publicaciones fail-closed validados con revisión final `PASS`.
+- [x] Commit funcional `e888b7f` creado con autoría RaykTo.
 
 ## Waiting / parked
 - [x] Presentación confirmada visualmente por el owner.
-- [ ] Confirmar con `Ctrl+F5` que la vista r5 aparece rápidamente y completa los datos en segundo plano.
+- [ ] Confirmar con `Ctrl+F5` que la vista r13 aparece rápidamente y muestra los estados correctos.
