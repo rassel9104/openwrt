@@ -7,6 +7,8 @@ STOP=10
 USE_PROCD=1
 
 STATE_DIR='/var/run/nano-shaper'
+GENERATION_FILE="$STATE_DIR/generation"
+PUBLICATION_LOCK="$STATE_DIR/state.lock"
 TABLE_FAMILY='inet'
 TABLE_NAME='nano_shaper'
 GATE_TABLE='nano_shaper_gate'
@@ -24,12 +26,26 @@ MAX_DEVICES=900
 DEFAULT_WAN_QDISC='qdisc fq_codel 0: root refcnt 2 limit 10240p flows 1024 quantum 1414 target 5ms interval 100ms memory_limit 4Mb ecn drop_batch 64'
 
 write_state() {
-	local state="$1" message="$2"
-	mkdir -p "$STATE_DIR"
-	printf '%s\n' "$state" > "$STATE_DIR/state.tmp"
-	printf '%s\n' "$message" > "$STATE_DIR/message.tmp"
-	mv "$STATE_DIR/state.tmp" "$STATE_DIR/state"
-	mv "$STATE_DIR/message.tmp" "$STATE_DIR/message"
+	local state="$1" message="$2" generation busy stable rc=0
+	mkdir -p "$STATE_DIR" || return 1
+	[ ! -L "$GENERATION_FILE" ] && [ ! -L "$PUBLICATION_LOCK" ] || return 1
+	exec 7>"$PUBLICATION_LOCK" || return 1
+	flock -x 7 || { exec 7>&-; return 1; }
+	generation="$(sed -n '1p' "$GENERATION_FILE" 2>/dev/null)"
+	is_uint "$generation" || generation=0
+	[ $((generation % 2)) -eq 0 ] || generation=$((generation + 1))
+	busy=$((generation + 1)); stable=$((generation + 2))
+	printf '%s\n' "$busy" > "$GENERATION_FILE.tmp" && mv "$GENERATION_FILE.tmp" "$GENERATION_FILE" || rc=1
+	if [ "$rc" = '0' ]; then
+		printf '%s\n' "$state" > "$STATE_DIR/state.tmp" &&
+			printf '%s\n' "$message" > "$STATE_DIR/message.tmp" &&
+			mv "$STATE_DIR/state.tmp" "$STATE_DIR/state" &&
+			mv "$STATE_DIR/message.tmp" "$STATE_DIR/message" &&
+			printf '%s\n' "$stable" > "$GENERATION_FILE.tmp" &&
+			mv "$GENERATION_FILE.tmp" "$GENERATION_FILE" || rc=1
+	fi
+	flock -u 7; exec 7>&-
+	return "$rc"
 }
 
 is_uint() {
@@ -338,6 +354,23 @@ save_manifest() {
 	printf '%s\n' installing > "$STATE_DIR/owned"
 }
 
+write_applied_snapshot() {
+	local scope="${1:-last_apply}" tmp="$STATE_DIR/applied-snapshot.tmp" ip
+	case "$scope" in last_apply|safe_fallback) ;; *) return 1 ;; esac
+	{
+		printf 'applied_at=%s\n' "$(date +%s)"
+		printf 'verification_scope=%s\n' "$scope"
+		printf 'wan_if=%s\n' "$wan_if"
+		printf 'total_down_kbit=%s\n' "$total_down_kbit"
+		printf 'total_up_kbit=%s\n' "$total_up_kbit"
+		printf 'other_down_kbit=%s\n' "$other_down_kbit"
+		printf 'other_up_kbit=%s\n' "$other_up_kbit"
+		printf 'degraded_kbit=%s\n' "$degraded_kbit"
+		printf 'other_count=%s\n' "$other_count"
+		for ip in $PRIORITY_IPS; do printf 'priority_ip=%s\n' "$ip"; done
+	} > "$tmp" && mv "$tmp" "$STATE_DIR/applied-snapshot"
+}
+
 load_manifest() {
 	saved_wan="$(cat "$STATE_DIR/wan_if" 2>/dev/null)"; saved_lan="$(cat "$STATE_DIR/lan_if" 2>/dev/null)"
 	saved_total_down="$(cat "$STATE_DIR/total_down_kbit" 2>/dev/null)"; saved_total_up="$(cat "$STATE_DIR/total_up_kbit" 2>/dev/null)"
@@ -471,9 +504,10 @@ activate_safe_fallback() {
 	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$degraded_kbit" &&
 		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$degraded_kbit" || return 1
 	[ "$require_accounting" != '1' ] || accounting_classifier_ok || return 1
-	printf '%s\n' active > "$STATE_DIR/owned"
+	write_applied_snapshot safe_fallback || return 1
 	remove_gate || return 1
-	write_state safe "$reason Se verificó el perfil preventivo de 64 Kbit/s para Otros."
+	printf '%s\n' active > "$STATE_DIR/owned"
+	write_state safe "$reason Se verificó el perfil preventivo de 64 Kbit/s para Otros." || return 1
 	[ "$require_accounting" != '0' ] || schedule_boot_promotion
 	return 0
 }
@@ -510,11 +544,12 @@ write_failure_state() {
 start_service() {
 	command -v tc >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 || { write_failure_state 'Faltan herramientas de shaping.'; return 1; }
 	acquire_tc_lock || { write_failure_state 'No se pudo obtener la exclusión para gestionar tc.'; return 1; }
+	write_state applying 'Aplicando y verificando el shaping.' || return 1
 	config_load bwlimit; config_get_bool enabled main enabled 0
 	if [ "$enabled" != '1' ]; then
 		[ ! -f "$STATE_DIR/owned" ] || clear_owned_rules || { write_failure_state 'El shaping activo no coincide con la firma propia; no se tocó.'; return 1; }
 		remove_gate || { write_failure_state 'La protección transitoria propia no pudo retirarse.'; return 1; }
-		write_state disabled 'Shaping desactivado.'
+		write_state disabled 'Shaping desactivado.' || return 1
 		return 0
 	fi
 	load_settings || { write_failure_state 'Configuración, interfaces o reservas prioritarias no válidas.'; return 1; }
@@ -548,16 +583,18 @@ start_service() {
 	install_classifier || { fail_after_clear 'Falló el clasificador prioritario.'; return 1; }
 	created_classifier=1
 	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" "$other_up_kbit" && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" "$other_down_kbit" && accounting_classifier_ok || { fail_after_clear 'Falló el readback del límite individual.'; return 1; }
-	printf '%s\n' active > "$STATE_DIR/owned"
 	remove_gate || { write_failure_state 'El shaping quedó instalado, pero la protección transitoria no pudo retirarse.'; return 1; }
-	write_state active 'Topes individuales y degradación a 64 Kbit/s verificados.'
+	write_applied_snapshot last_apply || { write_failure_state 'El shaping quedó instalado, pero no se pudo publicar su manifiesto aplicado.'; return 1; }
+	printf '%s\n' active > "$STATE_DIR/owned"
+	write_state active 'Topes individuales y degradación a 64 Kbit/s verificados.' || return 1
 }
 
 stop_service() {
 	acquire_tc_lock || { write_failure_state 'No se pudo obtener la exclusión para gestionar tc.'; return 1; }
+	write_state stopping 'Retirando de forma segura el shaping propio.' || return 1
 	[ ! -f "$STATE_DIR/owned" ] || clear_owned_rules || { write_failure_state 'El shaping activo no coincide con la firma propia; no se tocó.'; return 1; }
 	remove_gate || { write_failure_state 'La protección transitoria propia no pudo retirarse.'; return 1; }
-	write_state stopped 'Shaping detenido.'
+	write_state stopped 'Shaping detenido.' || return 1
 }
 
 reload_service() { start_service; }

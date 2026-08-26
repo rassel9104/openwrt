@@ -191,9 +191,10 @@ function renderAccounting(response) {
 }
 
 function renderShaper(response) {
-	var active = response.verified === '1';
+	var active = response.applied === '1';
+	var safeFallback = active && response.verification_scope === 'safe_fallback';
 	var priority = Array.isArray(response.priority_ips) ? response.priority_ips : [];
-	setText('nm-shaper-state', active ? 'Activo y verificado' : (response.enabled === '1' ? 'Requiere atención' : 'Desactivado'));
+	setText('nm-shaper-state', safeFallback ? 'Perfil preventivo verificado' : (active ? 'Última aplicación verificada' : (response.enabled === '1' ? 'Requiere atención' : 'Desactivado')));
 	setText('nm-shaper-message', response.message || 'Esperando readback del servicio.');
 	setText('nm-shaper-total', formatRate(Number(response.total_down_kbit) * 1000) + ' ↓ · ' + formatRate(Number(response.total_up_kbit) * 1000) + ' ↑');
 	setText('nm-shaper-ordinary', formatRate(Number(response.effective_other_down_kbit) * 1000) + ' ↓ · ' + formatRate(Number(response.effective_other_up_kbit) * 1000) + ' ↑');

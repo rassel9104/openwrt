@@ -16,6 +16,9 @@ BOOT_FILE="$STATE_DIR/accounting-boot-id"
 HANDOFF_FILE="$RUN_DIR/handoff"
 DEVICES_FILE="$RUN_DIR/devices"
 CURRENT_FILE="$RUN_DIR/current-devices"
+SNAPSHOT_FILE="$RUN_DIR/current-snapshot"
+GENERATION_FILE="$RUN_DIR/generation"
+PUBLICATION_LOCK="$RUN_DIR/state.lock"
 LIVE_SEEDS_FILE="$RUN_DIR/live-seeds"
 TABLE_IDS_FILE="$RUN_DIR/table-ids"
 REGISTRY='/usr/libexec/nano-monitor/device-registry'
@@ -26,6 +29,7 @@ LAN_HANDLE=1002
 SLOW_OFFSET=1000
 MAX_DEVICES=900
 POLL_INTERVAL=10
+VERIFICATION_INTERVAL=300
 BOOT_GUARD_SECONDS=60
 export TZ
 
@@ -49,12 +53,26 @@ valid_id() {
 }
 
 write_runtime() {
-	local state="$1" message="$2"
-	mkdir -p "$RUN_DIR"
-	printf '%s\n' "$state" > "$RUN_DIR/state.tmp"
-	printf '%s\n' "$message" > "$RUN_DIR/message.tmp"
-	mv "$RUN_DIR/state.tmp" "$RUN_DIR/state"
-	mv "$RUN_DIR/message.tmp" "$RUN_DIR/message"
+	local state="$1" message="$2" generation busy stable rc=0
+	mkdir -p "$RUN_DIR" || return 1
+	[ ! -L "$GENERATION_FILE" ] && [ ! -L "$PUBLICATION_LOCK" ] || return 1
+	exec 7>"$PUBLICATION_LOCK" || return 1
+	flock -x 7 || { exec 7>&-; return 1; }
+	generation="$(sed -n '1p' "$GENERATION_FILE" 2>/dev/null)"
+	is_uint "$generation" || generation=0
+	[ $((generation % 2)) -eq 0 ] || generation=$((generation + 1))
+	busy=$((generation + 1)); stable=$((generation + 2))
+	printf '%s\n' "$busy" > "$GENERATION_FILE.tmp" && mv "$GENERATION_FILE.tmp" "$GENERATION_FILE" || rc=1
+	if [ "$rc" = '0' ]; then
+		printf '%s\n' "$state" > "$RUN_DIR/state.tmp" &&
+			printf '%s\n' "$message" > "$RUN_DIR/message.tmp" &&
+			mv "$RUN_DIR/state.tmp" "$RUN_DIR/state" &&
+			mv "$RUN_DIR/message.tmp" "$RUN_DIR/message" &&
+			printf '%s\n' "$stable" > "$GENERATION_FILE.tmp" &&
+			mv "$GENERATION_FILE.tmp" "$GENERATION_FILE" || rc=1
+	fi
+	flock -u 7; exec 7>&-
+	return "$rc"
 }
 
 add_priority_ip() {
@@ -312,6 +330,38 @@ quota_used_for() {
 	printf '%s' "$value"
 }
 
+quota_bytes_for() {
+	local id="$1" value
+	valid_id "$id" || return 1
+	value="$(nft -j list quota "$TABLE_FAMILY" "$TABLE_NAME" "q_$id" 2>/dev/null | jsonfilter -e '@.nftables[*].quota.bytes' 2>/dev/null)"
+	is_uint "$value" || return 1
+	printf '%s' "$value"
+}
+
+write_current_snapshot() {
+	local tmp="$SNAPSHOT_FILE.tmp" tab id mac ip name used
+	[ ! -L "$SNAPSHOT_FILE" ] || return 1
+	tab="$(printf '\t')"
+	{
+		printf 'updated_at=%s\n' "$(date +%s)"
+		printf 'verified_at=%s\n' "$verified_at"
+		printf 'day=%s\n' "$period_day"
+		printf 'quota_enabled=%s\n' "$quota_enabled"
+		printf 'quota_bytes=%s\n' "$quota_bytes"
+		printf 'reset_hour=%s\n' "$reset_hour"
+		printf 'reset_minute=%s\n' "$reset_minute"
+		printf 'internet_up=%s\n' "$internet_up"
+		printf 'internet_down=%s\n' "$internet_down"
+		printf 'priority_up=%s\n' "$priority_up"
+		printf 'priority_down=%s\n' "$priority_down"
+		printf 'others_up=%s\n' "$others_up"
+		printf 'others_down=%s\n' "$others_down"
+		while IFS="$tab" read -r id mac ip name used; do
+			[ -z "$id" ] || printf 'device\t%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$used"
+		done < "$CURRENT_FILE"
+	} > "$tmp" && mv "$tmp" "$SNAPSHOT_FILE"
+}
+
 read_counters() {
 	local tab id mac ip name used tmp="$CURRENT_FILE.tmp"
 	internet_up="$(counter_bytes internet_up)" || return 1
@@ -332,6 +382,79 @@ read_counters() {
 		uint_ge "$used" "$quota_bytes" && degraded_count=$((degraded_count + 1))
 	done < "$DEVICES_FILE"
 	mv "$tmp" "$CURRENT_FILE"
+}
+
+topology_fingerprint() {
+	local rules
+	# nft's textual readback is stable on the target. Only object counters and
+	# quota consumption are mutable; every other token defines owned topology.
+	rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" |
+		awk '{
+			gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>")
+			gsub(/used [0-9]+ bytes/, "used <runtime> bytes")
+			print
+		}' |
+		sha256sum | awk '{ print $1 }'
+}
+
+expected_topology_fingerprint() {
+	local tab id mac ip name classid=101 slowid expected
+	tab="$(printf '\t')"
+	expected="$({
+		printf 'table %s %s {\n' "$TABLE_FAMILY" "$TABLE_NAME"
+		printf '\tcomment "%s"\n' "$OWNER_COMMENT"
+		for name in internet_up internet_down priority_up priority_down others_up others_down; do
+			printf '\tcounter %s {\n\t\tpackets <runtime> bytes <runtime>\n\t}\n\n' "$name"
+		done
+		while IFS="$tab" read -r id mac ip name; do
+			[ -z "$id" ] && continue
+			printf '\tquota q_%s {\n\t\t%s bytes used <runtime> bytes\n\t}\n\n' "$id" "$quota_bytes"
+		done < "$DEVICES_FILE"
+		printf '\tset priority_v4 {\n\t\ttype ipv4_addr\n\t\telements = { %s }\n\t}\n\n' "$PRIORITY_SET"
+		printf '\tchain account {\n'
+		printf '\t\ttype filter hook forward priority filter - 6; policy accept;\n'
+		printf '\t\tiifname "%s" oifname "%s" ip saddr @priority_v4 counter name "internet_up" counter name "priority_up" return\n' "$lan_if" "$wan_if"
+		printf '\t\tiifname "%s" oifname "%s" ip saddr %s ip saddr != @priority_v4 counter name "internet_up" counter name "others_up"\n' "$lan_if" "$wan_if" "$subnet"
+		while IFS="$tab" read -r id mac ip name; do
+			[ -z "$id" ] && continue
+			slowid=$((classid + SLOW_OFFSET))
+			printf '\t\tiifname "%s" oifname "%s" ip saddr %s quota name "q_%s" meta priority set %s:%s return\n' "$lan_if" "$wan_if" "$ip" "$id" "$WAN_HANDLE" "$classid"
+			printf '\t\tiifname "%s" oifname "%s" ip saddr %s meta priority set %s:%s return\n' "$lan_if" "$wan_if" "$ip" "$WAN_HANDLE" "$slowid"
+			classid=$((classid + 1))
+		done < "$DEVICES_FILE"
+		printf '\t\tiifname "%s" oifname "%s" ip daddr @priority_v4 counter name "internet_down" counter name "priority_down" return\n' "$wan_if" "$lan_if"
+		printf '\t\tiifname "%s" oifname "%s" ip daddr %s ip daddr != @priority_v4 counter name "internet_down" counter name "others_down"\n' "$wan_if" "$lan_if" "$subnet"
+		classid=101
+		while IFS="$tab" read -r id mac ip name; do
+			[ -z "$id" ] && continue
+			slowid=$((classid + SLOW_OFFSET))
+			printf '\t\tiifname "%s" oifname "%s" ip daddr %s quota name "q_%s" meta priority set %s:%s return\n' "$wan_if" "$lan_if" "$ip" "$id" "$LAN_HANDLE" "$classid"
+			printf '\t\tiifname "%s" oifname "%s" ip daddr %s meta priority set %s:%s return\n' "$wan_if" "$lan_if" "$ip" "$LAN_HANDLE" "$slowid"
+			classid=$((classid + 1))
+		done < "$DEVICES_FILE"
+		printf '\t}\n}\n'
+	})" || return 1
+	printf '%s\n' "$expected" | sha256sum | awk '{ print $1 }'
+}
+
+verify_runtime() {
+	local ruleset current_wan tab id mac ip name actual expected current
+	current_wan="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	[ "$current_wan" = "$wan_if" ] || return 1
+	expected="$(expected_topology_fingerprint)" || return 1
+	current="$(topology_fingerprint)" || return 1
+	[ -n "$expected" ] && [ "$current" = "$expected" ] || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		actual="$(quota_bytes_for "$id")" || return 1
+		[ "$actual" = "$quota_bytes" ] || return 1
+	done < "$DEVICES_FILE"
+	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = '0' ] || return 1
+	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = '0' ] || return 1
+	ruleset="$(nft list ruleset 2>/dev/null)" || return 1
+	! printf '%s\n' "$ruleset" | grep -Eq '(^|[[:space:]])flowtable[[:space:]]|flow add @'
 }
 
 zero_current_devices() {
@@ -476,6 +599,7 @@ reset_period_if_due() {
 	# ISO dates sort chronologically. Never reset backwards while pre-NTP time is
 	# older than the durable period.
 	[ "$now_day" \> "$period_day" ] && [ "$now_minute" -ge "$reset_at_minute" ] || return 0
+	write_runtime applying 'Reiniciando de forma durable el periodo diario.' || return 1
 	period_day="$now_day"
 	for name in internet_up internet_down priority_up priority_down others_up others_down; do eval "$name=0"; done
 	deliberate_daily_reset=1
@@ -484,6 +608,10 @@ reset_period_if_due() {
 	live_table_present=0
 	install_table || return 1
 	read_counters || return 1
+	verify_runtime || return 1
+	verified_at="$(date +%s)"
+	last_verify_epoch="$verified_at"
+	write_current_snapshot || return 1
 	rm -rf "$DEVICE_STATE_DIR" || return 1
 	rm -f "$MIGRATION_FILE" || return 1
 	migration_active=0; migration_seed=0
@@ -492,6 +620,7 @@ reset_period_if_due() {
 }
 
 handle_persist_failure() {
+	write_runtime applying 'Aplicando el perfil preventivo tras un fallo de persistencia.' || return 1
 	force_degraded=1
 	install_table >/dev/null 2>&1 || return 1
 	write_runtime error 'No se pudo guardar el estado; Otros queda limitado a 64 Kbit/s de forma preventiva.'
@@ -506,18 +635,19 @@ update_runtime_message() {
 }
 
 cleanup() {
+	write_runtime stopping 'Persistiendo y retirando de forma segura la contabilidad.' || exit 1
 	nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 || { write_runtime error 'La tabla de contabilidad desapareció; el estado permanece marcado como abierto.'; exit 1; }
 	accounting_table_owned || { write_runtime error 'La tabla de contabilidad no conserva la firma propia; no se tocó.'; exit 1; }
 	persist_state >/dev/null 2>&1 || { write_runtime error 'No se pudo guardar el estado; la cuota permanece instalada.'; exit 1; }
 	if [ -f "$HANDOFF_FILE" ] && [ ! -L "$HANDOFF_FILE" ]; then
 		# Keep the verified table only for an explicitly requested successor.
 		mark_runtime_clean || { write_runtime error 'No se pudo cerrar el estado durable.'; exit 1; }
-		write_runtime stopped 'Contabilidad en relevo; la última cuota verificada permanece aplicada.'
+		write_runtime stopped 'Contabilidad en relevo; la última cuota verificada permanece aplicada.' || exit 1
 	else
 		nft delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null || { write_runtime error 'No se pudo retirar la tabla propia al detener el servicio.'; exit 1; }
 		nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 && { write_runtime error 'La tabla propia sigue activa después de detener el servicio.'; exit 1; }
 		mark_runtime_clean || { write_runtime error 'No se pudo cerrar el estado durable.'; exit 1; }
-		write_runtime stopped 'Contabilidad detenida y tabla propia retirada.'
+		write_runtime stopped 'Contabilidad detenida y tabla propia retirada.' || exit 1
 	fi
 	exit 0
 }
@@ -527,7 +657,9 @@ main() {
 	force_degraded=0
 	deliberate_daily_reset=0
 	mkdir -p "$RUN_DIR" || exit 1
-	command -v nft >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 || { write_runtime error 'Faltan nftables, jsonfilter o awk.'; exit 1; }
+	command -v flock >/dev/null 2>&1 || exit 1
+	write_runtime starting 'Preparando y verificando la contabilidad diaria.' || exit 1
+	command -v nft >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 || { write_runtime error 'Faltan nftables, jsonfilter, awk o sha256sum.'; exit 1; }
 	load_settings || { write_runtime error 'Configuración, dispositivos o interfaz WAN no válidos.'; exit 1; }
 	inspect_previous_session || { write_runtime error 'El marcador de persistencia no es seguro.'; exit 1; }
 	inspect_boot || { write_runtime error 'No se pudo verificar la identidad del arranque.'; exit 1; }
@@ -545,6 +677,9 @@ main() {
 	install_table || { write_runtime error 'No se pudo instalar la contabilidad individual.'; exit 1; }
 	deliberate_daily_reset=0
 	read_counters || { write_runtime error 'No se pudieron leer los objetos nftables.'; exit 1; }
+	verify_runtime || { write_runtime error 'El readback efectivo de la contabilidad no coincide.'; exit 1; }
+	verified_at="$(date +%s)"
+	write_current_snapshot || { write_runtime error 'No se pudo publicar el snapshot de contabilidad.'; exit 1; }
 	persist_values || { handle_persist_failure; exit 1; }
 	persist_table_ids || { handle_persist_failure; exit 1; }
 	persist_boot_id || { handle_persist_failure; exit 1; }
@@ -556,17 +691,24 @@ main() {
 	trap cleanup TERM INT
 	last_persist_epoch="$(date +%s)"
 	last_persist_total="$device_total_used"
-	update_runtime_message
+	last_verify_epoch="$verified_at"
+	update_runtime_message || exit 1
 	while sleep "$POLL_INTERVAL"; do
 		nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 || { write_runtime error 'La tabla nftables desapareció; se reintentará el servicio.'; exit 1; }
 		reset_period_if_due || { write_runtime error 'No se pudo completar de forma durable el reset diario.'; exit 1; }
 		read_counters || { write_runtime error 'No se pudieron leer los objetos nftables.'; exit 1; }
 		now_epoch="$(date +%s)"
+		if [ $((now_epoch - last_verify_epoch)) -ge "$VERIFICATION_INTERVAL" ]; then
+			verify_runtime || { write_runtime error 'El readback periódico de la contabilidad no coincide.'; exit 1; }
+			verified_at="$now_epoch"
+			last_verify_epoch="$now_epoch"
+		fi
+		write_current_snapshot || { write_runtime error 'No se pudo actualizar el snapshot de contabilidad.'; exit 1; }
 		delta="$(awk -v a="$device_total_used" -v b="$last_persist_total" 'BEGIN { printf "%.0f", a - b }')"
 		if [ $((now_epoch - last_persist_epoch)) -ge "$persist_interval" ] || uint_ge "$delta" "$persist_step"; then
 			persist_values || { handle_persist_failure; exit 1; }
 		fi
-		update_runtime_message
+		update_runtime_message || exit 1
 	done
 }
 

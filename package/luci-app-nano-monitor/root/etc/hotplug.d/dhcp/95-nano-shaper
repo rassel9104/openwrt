@@ -2,6 +2,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
+publish_accounting_restarting() {
+	local dir='/var/run/nano-accounting' generation_file lock_file generation busy stable rc=0
+	generation_file="$dir/generation"
+	lock_file="$dir/state.lock"
+	mkdir -p "$dir" || return 1
+	[ ! -L "$generation_file" ] && [ ! -L "$lock_file" ] || return 1
+	exec 7>"$lock_file" || return 1
+	flock -x 7 || { exec 7>&-; return 1; }
+	generation="$(sed -n '1p' "$generation_file" 2>/dev/null)"
+	case "$generation" in ''|*[!0-9]*) generation=0 ;; esac
+	[ $((generation % 2)) -eq 0 ] || generation=$((generation + 1))
+	busy=$((generation + 1)); stable=$((generation + 2))
+	printf '%s\n' "$busy" > "$generation_file.tmp" && mv "$generation_file.tmp" "$generation_file" || rc=1
+	if [ "$rc" = '0' ]; then
+		printf '%s\n' restarting > "$dir/state.tmp" &&
+			printf '%s\n' 'Reiniciando y verificando la contabilidad diaria.' > "$dir/message.tmp" &&
+			mv "$dir/state.tmp" "$dir/state" &&
+			mv "$dir/message.tmp" "$dir/message" &&
+			printf '%s\n' "$stable" > "$generation_file.tmp" &&
+			mv "$generation_file.tmp" "$generation_file" || rc=1
+	fi
+	flock -u 7; exec 7>&-
+	return "$rc"
+}
+
 reconcile() {
 	lock_file='/var/run/nano-reconcile.lock'
 	pending='/var/run/nano-reconcile.pending'
@@ -23,9 +48,8 @@ reconcile() {
 	while :; do
 		rm -f "$pending"
 		accounting_ready=0
-		mkdir -p /var/run/nano-accounting
-		printf '%s\n' restarting > /var/run/nano-accounting/state
-		printf 'pid=%s\n' "$$" > /var/run/nano-accounting/handoff
+		publish_accounting_restarting || { rc=1; break; }
+		printf 'pid=%s\n' "$$" > /var/run/nano-accounting/handoff || { rc=1; break; }
 		/etc/init.d/nano-accounting stop 9>&- >/dev/null 2>&1 && /etc/init.d/nano-accounting start 9>&- >/dev/null 2>&1 || { rc=1; break; }
 		attempt=0
 		while [ "$attempt" -lt 10 ] && [ "$(cat /var/run/nano-accounting/state 2>/dev/null)" != 'active' ]; do

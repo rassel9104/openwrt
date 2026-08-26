@@ -11,7 +11,7 @@ PID_FILE="$WORK_DIR/pid"
 HELPER='/usr/libexec/nano-monitor/run-speedtest'
 SHAPER_STATE_DIR='/var/run/nano-shaper'
 ACCOUNT_STATE_DIR='/var/run/nano-accounting'
-ACCOUNT_PERSIST='/etc/nano-monitor/daily-state'
+ACCOUNT_SNAPSHOT="$ACCOUNT_STATE_DIR/current-snapshot"
 DEVICE_REGISTRY='/usr/libexec/nano-monitor/device-registry'
 RECONCILE='/etc/hotplug.d/dhcp/95-nano-shaper'
 WAN_HANDLE=1001
@@ -240,31 +240,72 @@ restore_quota_value() {
 }
 
 method_accounting() {
-	local internet_up internet_down priority_up priority_down others_up others_down quota_bytes quota_enabled quota_used remaining verified period_day timezone reset_hour reset_minute reset_at data_ok=1 value registry tab id mac ip name used left degraded device_count capacity degraded_count
+	local internet_up=0 internet_down=0 priority_up=0 priority_down=0 others_up=0 others_down=0 quota_bytes=700000000 quota_enabled=0 quota_used remaining verified period_day timezone reset_hour=0 reset_minute=1 reset_at data_ok=1 value registry tab id mac ip name used left degraded device_count capacity degraded_count account_state account_message updated_at verified_at now age snapshot line configured_quota configured_enabled configured_reset_hour configured_reset_minute generation_before generation_after
 	config_load bwlimit
-	config_get_bool quota_enabled main quota_enabled 1
-	[ "$quota_enabled" = '1' ] || data_ok=0
-	config_get quota_bytes main quota_per_device_bytes '700000000'
-	config_get reset_hour main quota_reset_hour '0'
-	config_get reset_minute main quota_reset_minute '1'
-	internet_up="$(nft_counter_bytes internet_up)" || data_ok=0
-	internet_down="$(nft_counter_bytes internet_down)" || data_ok=0
-	priority_up="$(nft_counter_bytes priority_up)" || data_ok=0
-	priority_down="$(nft_counter_bytes priority_down)" || data_ok=0
-	others_up="$(nft_counter_bytes others_up)" || data_ok=0
-	others_down="$(nft_counter_bytes others_down)" || data_ok=0
+	config_get_bool configured_enabled main quota_enabled 1
+	config_get configured_quota main quota_per_device_bytes '700000000'
+	config_get configured_reset_hour main quota_reset_hour '0'
+	config_get configured_reset_minute main quota_reset_minute '1'
+	[ -f "$ACCOUNT_SNAPSHOT" ] && [ ! -L "$ACCOUNT_SNAPSHOT" ] || data_ok=0
+	generation_before="$(cat "$ACCOUNT_STATE_DIR/generation" 2>/dev/null)"
+	account_state="$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)"
+	account_message="$(cat "$ACCOUNT_STATE_DIR/message" 2>/dev/null)"
+	snapshot="$(cat "$ACCOUNT_SNAPSHOT" 2>/dev/null)" || data_ok=0
+	generation_after="$(cat "$ACCOUNT_STATE_DIR/generation" 2>/dev/null)"
+	is_uint "$generation_before" && [ $((generation_before % 2)) -eq 0 ] && [ "$generation_before" = "$generation_after" ] || data_ok=0
+	registry=''
+	tab="$(printf '\t')"
+	while IFS= read -r line; do
+		case "$line" in
+			updated_at=*) updated_at="${line#*=}" ;;
+			verified_at=*) verified_at="${line#*=}" ;;
+			day=*) period_day="${line#*=}" ;;
+			quota_enabled=*) quota_enabled="${line#*=}" ;;
+			quota_bytes=*) quota_bytes="${line#*=}" ;;
+			reset_hour=*) reset_hour="${line#*=}" ;;
+			reset_minute=*) reset_minute="${line#*=}" ;;
+			internet_up=*) internet_up="${line#*=}" ;;
+			internet_down=*) internet_down="${line#*=}" ;;
+			priority_up=*) priority_up="${line#*=}" ;;
+			priority_down=*) priority_down="${line#*=}" ;;
+			others_up=*) others_up="${line#*=}" ;;
+			others_down=*) others_down="${line#*=}" ;;
+			device"$tab"*) registry="${registry}${registry:+
+}${line#device$tab}" ;;
+		esac
+	done <<EOF
+$snapshot
+EOF
 	for value in internet_up internet_down priority_up priority_down others_up others_down; do
-		eval "[ -n \"\${$value}\" ] || $value=0"
+		eval "used=\${$value}"
+		is_uint "$used" || { eval "$value=0"; data_ok=0; }
 	done
-	registry="$($DEVICE_REGISTRY 2>/dev/null)" || { registry=''; data_ok=0; }
+	is_uint "$quota_bytes" && uint_ge "$quota_bytes" 100000000 && uint_ge 1000000000000 "$quota_bytes" || { quota_bytes=700000000; data_ok=0; }
+	[ "$quota_enabled" = '1' ] || data_ok=0
+	is_uint "$reset_hour" && is_uint "$reset_minute" && [ "$reset_hour" -le 23 ] && [ "$reset_minute" -le 59 ] || { reset_hour=0; reset_minute=1; data_ok=0; }
+	[ "$configured_enabled" = "$quota_enabled" ] && [ "$configured_quota" = "$quota_bytes" ] && [ "$configured_reset_hour" = "$reset_hour" ] && [ "$configured_reset_minute" = "$reset_minute" ] || data_ok=0
+	case "$period_day" in ????-??-??) ;; *) period_day="$(date +%F)"; data_ok=0 ;; esac
+	if is_uint "$updated_at"; then
+		now="$(date +%s)"
+		age=$((now - updated_at))
+		[ "$age" -ge 0 ] && [ "$age" -le 60 ] || data_ok=0
+	else
+		data_ok=0
+	fi
+	if is_uint "$verified_at"; then
+		age=$((now - verified_at))
+		[ "$age" -ge 0 ] && [ "$age" -le 360 ] || data_ok=0
+	else
+		data_ok=0
+	fi
 	quota_used=0
 	remaining=0
 	device_count=0
 	degraded_count=0
 	tab="$(printf '\t')"
-	while IFS="$tab" read -r id mac ip name; do
+	while IFS="$tab" read -r id mac ip name used; do
 		[ -z "$id" ] && continue
-		used="$(nft_quota_used "$id")" || { used=0; data_ok=0; }
+		is_uint "$used" || { used=0; data_ok=0; }
 		left="$(uint_sub_floor "$quota_bytes" "$used")"
 		quota_used="$(awk -v a="$quota_used" -v b="$used" 'BEGIN { printf "%.0f", a + b }')"
 		remaining="$(awk -v a="$remaining" -v b="$left" 'BEGIN { printf "%.0f", a + b }')"
@@ -275,17 +316,15 @@ $registry
 EOF
 	capacity="$(uint_mul "$quota_bytes" "$device_count")"
 	verified='0'
-	[ "$data_ok" = '1' ] && runtime_accounting_ok && verified='1'
-	period_day="$(sed -n 's/^day=//p' "$ACCOUNT_PERSIST" 2>/dev/null | sed -n '1p')"
-	[ -n "$period_day" ] || period_day="$(date +%F)"
+	[ "$data_ok" = '1' ] && [ "$account_state" = 'active' ] && verified='1'
 	timezone="$(uci -q get system.@system[0].zonename)"
 	reset_at="$(printf '%02d:%02d' "$reset_hour" "$reset_minute" 2>/dev/null)"
 	[ -n "$reset_at" ] || reset_at='00:01'
 
 	json_init
 	json_add_string verified "$verified"
-	json_add_string state "$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)"
-	json_add_string message "$(cat "$ACCOUNT_STATE_DIR/message" 2>/dev/null)"
+	json_add_string state "$account_state"
+	json_add_string message "$account_message"
 	json_add_string period_day "$period_day"
 	json_add_string timezone "${timezone:-sistema local}"
 	json_add_string reset_at "$reset_at"
@@ -304,9 +343,8 @@ EOF
 	json_add_string others_up "$others_up"
 	json_add_string others_down "$others_down"
 	json_add_array devices
-	while IFS="$tab" read -r id mac ip name; do
+	while IFS="$tab" read -r id mac ip name used; do
 		[ -z "$id" ] && continue
-		used="$(nft_quota_used "$id" 2>/dev/null)"
 		is_uint "$used" || used=0
 		left="$(uint_sub_floor "$quota_bytes" "$used")"
 		degraded='0'
@@ -502,25 +540,46 @@ EOF
 }
 
 method_shaper() {
-	local enabled state message total_down total_up other_down other_up degraded effective_down effective_up other_count wan_if verified
+	local enabled=0 state message total_down=0 total_up=0 other_down=0 other_up=0 degraded=0 effective_down=0 effective_up=0 other_count=0 wan_if verified applied owned value data_ok=1 snapshot line priority_ips ip applied_at verification_scope generation_before generation_after
 	config_load bwlimit
 	config_get_bool enabled main enabled 0
-	config_get total_down main total_down_kbit '8800'
-	config_get total_up main total_up_kbit '4200'
-	config_get other_down main other_down_kbit '768'
-	config_get other_up main other_up_kbit '128'
-	config_get degraded main other_degraded_kbit '64'
+	generation_before="$(cat "$SHAPER_STATE_DIR/generation" 2>/dev/null)"
 	state="$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)"
 	message="$(cat "$SHAPER_STATE_DIR/message" 2>/dev/null)"
-	wan_if="$(cat "$SHAPER_STATE_DIR/wan_if" 2>/dev/null)"
-	effective_down="$(cat "$SHAPER_STATE_DIR/other_down_kbit" 2>/dev/null)"
-	effective_up="$(cat "$SHAPER_STATE_DIR/other_up_kbit" 2>/dev/null)"
-	other_count="$(cat "$SHAPER_STATE_DIR/other_count" 2>/dev/null)"
+	owned="$(cat "$SHAPER_STATE_DIR/owned" 2>/dev/null)"
+	[ -f "$SHAPER_STATE_DIR/applied-snapshot" ] && [ ! -L "$SHAPER_STATE_DIR/applied-snapshot" ] || data_ok=0
+	snapshot="$(cat "$SHAPER_STATE_DIR/applied-snapshot" 2>/dev/null)" || data_ok=0
+	generation_after="$(cat "$SHAPER_STATE_DIR/generation" 2>/dev/null)"
+	is_uint "$generation_before" && [ $((generation_before % 2)) -eq 0 ] && [ "$generation_before" = "$generation_after" ] || data_ok=0
+	priority_ips=''
+	while IFS= read -r line; do
+		case "$line" in
+			applied_at=*) applied_at="${line#*=}" ;;
+			verification_scope=*) verification_scope="${line#*=}" ;;
+			wan_if=*) wan_if="${line#*=}" ;;
+			total_down_kbit=*) total_down="${line#*=}" ;;
+			total_up_kbit=*) total_up="${line#*=}" ;;
+			other_down_kbit=*) other_down="${line#*=}"; effective_down="$other_down" ;;
+			other_up_kbit=*) other_up="${line#*=}"; effective_up="$other_up" ;;
+			degraded_kbit=*) degraded="${line#*=}" ;;
+			other_count=*) other_count="${line#*=}" ;;
+			priority_ip=*) ip="${line#*=}"; priority_ips="${priority_ips}${priority_ips:+ }$ip" ;;
+		esac
+	done <<EOF
+$snapshot
+EOF
+	case "$verification_scope:$state" in last_apply:active|safe_fallback:safe) ;; *) data_ok=0 ;; esac
+	for value in total_down total_up other_down other_up degraded effective_down effective_up other_count; do
+		eval "value=\${$value}"
+		is_uint "$value" || data_ok=0
+	done
+	is_uint "$applied_at" || data_ok=0
 	verified='0'
-	if [ "$enabled" = '1' ] && runtime_shaper_ok; then
-		verified='1'
+	applied='0'
+	if [ "$enabled" = '1' ] && [ "$owned" = 'active' ] && [ "$data_ok" = '1' ]; then
+		applied='1'
 	else
-		[ "$state" != 'active' ] || message='El readback efectivo de nftables y tc no coincide.'
+		case "$state" in active|safe) message='El último readback verificado del servicio no está disponible.' ;; esac
 	fi
 
 	json_init
@@ -528,6 +587,8 @@ method_shaper() {
 	json_add_string state "${state:-unknown}"
 	json_add_string message "$message"
 	json_add_string verified "$verified"
+	json_add_string applied "$applied"
+	json_add_string verification_scope "${verification_scope:-unavailable}"
 	json_add_string wan_if "$wan_if"
 	json_add_string total_down_kbit "$total_down"
 	json_add_string total_up_kbit "$total_up"
@@ -538,7 +599,7 @@ method_shaper() {
 	json_add_string effective_other_up_kbit "${effective_up:-$other_up}"
 	json_add_string other_count "${other_count:-0}"
 	json_add_array priority_ips
-	config_list_foreach main exempt_ip add_priority_json
+	for ip in $priority_ips; do json_add_string '' "$ip"; done
 	json_close_array
 	json_dump
 	json_cleanup
