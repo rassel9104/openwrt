@@ -2,23 +2,64 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
-# Las configuraciones nano-monitor y bwlimit son conffiles: no se reescriben aquí.
-if uci -q get nlbwmon.@nlbwmon[0] >/dev/null; then
-	uci -q set nlbwmon.@nlbwmon[0].netlink_buffer_size='131072'
-	uci -q set nlbwmon.@nlbwmon[0].refresh_interval='10s'
-	uci -q set nlbwmon.@nlbwmon[0].commit_interval='24h'
-	uci -q set nlbwmon.@nlbwmon[0].database_generations='2'
-	uci -q set nlbwmon.@nlbwmon[0].database_limit='1000'
-	uci -q set nlbwmon.@nlbwmon[0].database_compress='1'
-	uci -q set nlbwmon.@nlbwmon[0].protocol_database='/dev/null'
-	uci -q commit nlbwmon
+# Las configuraciones son conffiles: sólo se añaden claves ausentes para migrar a v3.
+migrated_from_legacy=0
+if uci -q get bwlimit.main >/dev/null; then
+	previous_schema="$(uci -q get bwlimit.main.schema_version)"
+	uci -q set bwlimit.main.schema_version='3'
+	[ -n "$(uci -q get bwlimit.main.wan_network)" ] || uci -q set bwlimit.main.wan_network='provider'
+	if [ "$previous_schema" != '3' ]; then
+		migrated_from_legacy=1
+		uci -q set bwlimit.main.enabled='0'
+		uci -q set bwlimit.main.total_down_kbit='8800'
+		uci -q set bwlimit.main.total_up_kbit='4200'
+		uci -q delete bwlimit.main.exempt_ip
+		uci -q add_list bwlimit.main.exempt_ip='192.168.1.58'
+		uci -q add_list bwlimit.main.exempt_ip='192.168.1.59'
+	else
+		[ -n "$(uci -q get bwlimit.main.total_down_kbit)" ] || uci -q set bwlimit.main.total_down_kbit='8800'
+		[ -n "$(uci -q get bwlimit.main.total_up_kbit)" ] || uci -q set bwlimit.main.total_up_kbit='4200'
+	fi
+	[ -n "$(uci -q get bwlimit.main.enabled)" ] || uci -q set bwlimit.main.enabled='0'
+	[ -n "$(uci -q get bwlimit.main.other_min_down_kbit)" ] || uci -q set bwlimit.main.other_min_down_kbit='500'
+	[ -n "$(uci -q get bwlimit.main.other_min_up_kbit)" ] || uci -q set bwlimit.main.other_min_up_kbit='128'
+	[ -n "$(uci -q get bwlimit.main.quota_enabled)" ] || uci -q set bwlimit.main.quota_enabled='1'
+	[ -n "$(uci -q get bwlimit.main.quota_bytes)" ] || uci -q set bwlimit.main.quota_bytes='2000000000'
+	[ -n "$(uci -q get bwlimit.main.quota_reset_hour)" ] || uci -q set bwlimit.main.quota_reset_hour='0'
+	[ -n "$(uci -q get bwlimit.main.quota_reset_minute)" ] || uci -q set bwlimit.main.quota_reset_minute='1'
+	[ -n "$(uci -q get bwlimit.main.quota_persist_interval)" ] || uci -q set bwlimit.main.quota_persist_interval='1800'
+	[ -n "$(uci -q get bwlimit.main.quota_persist_step_bytes)" ] || uci -q set bwlimit.main.quota_persist_step_bytes='64000000'
+	uci -q commit bwlimit
 fi
 
-/etc/init.d/nlbwmon enable >/dev/null 2>&1
+# La contabilidad diaria se calcula explícitamente en la zona del propietario.
+uci -q set system.@system[0].zonename='America/New_York'
+uci -q set system.@system[0].timezone='EST5EDT,M3.2.0,M11.1.0'
+uci -q commit system
+
+# Tanto los contadores forward como HTB requieren que los flujos no los eludan.
+# Es una invariante del paquete completo, no una mutación temporal del shaper.
+uci -q set firewall.@defaults[0].flow_offloading='0'
+uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+uci -q commit firewall
+/etc/init.d/firewall restart >/dev/null 2>&1
+
+/etc/init.d/nano-accounting enable >/dev/null 2>&1
+# La versión anterior instalaba este limitador. Debe quedar retirado incluso
+# cuando el nuevo shaping se mantenga desactivado para una puesta en marcha segura.
+/etc/init.d/bwlimit disable >/dev/null 2>&1
+/etc/init.d/bwlimit stop >/dev/null 2>&1
+nft delete table inet bwlimit >/dev/null 2>&1
+nft list table inet bwlimit >/dev/null 2>&1 && exit 1
+rm -f /etc/rc.d/S??bwlimit /etc/rc.d/K??bwlimit
+if [ "$migrated_from_legacy" = '1' ] && [ -x /etc/init.d/nlbwmon ]; then
+	/etc/init.d/nlbwmon stop >/dev/null 2>&1
+	/etc/init.d/nlbwmon disable >/dev/null 2>&1
+fi
 if [ "$(uci -q get bwlimit.main.enabled)" = '1' ]; then
-	/etc/init.d/bwlimit enable >/dev/null 2>&1
+	/etc/init.d/nano-shaper enable >/dev/null 2>&1
 else
-	/etc/init.d/bwlimit disable >/dev/null 2>&1
+	/etc/init.d/nano-shaper disable >/dev/null 2>&1
 fi
 
 exit 0

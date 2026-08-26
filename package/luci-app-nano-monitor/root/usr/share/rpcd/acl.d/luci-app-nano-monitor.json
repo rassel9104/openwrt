@@ -3,13 +3,13 @@
 		"description": "Administrar el monitor de red del Nano",
 		"read": {
 			"ubus": {
-				"luci.nano-monitor": [ "status", "devices" ]
+				"luci.nano-monitor": [ "status", "accounting", "shaper" ]
 			},
 			"uci": [ "nano-monitor", "bwlimit" ]
 		},
 		"write": {
 			"ubus": {
-				"luci.nano-monitor": [ "start" ]
+				"luci.nano-monitor": [ "start", "set_quota" ]
 			},
 			"uci": [ "nano-monitor" ]
 		}

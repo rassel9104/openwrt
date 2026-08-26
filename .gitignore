@@ -35,3 +35,15 @@ git-src
 .cproject
 .ccache
 .vscode*
+# BEGIN RAYKTO MANAGED
+# RaykTo runtime, packaged skills and generated control state are local tooling.
+/docs/
+/.opencode/
+/recovery-kit/
+/scripts/*
+/.agent/*
+!/.agent/state/
+/.agent/state/*
+!/.agent/state/executive-handoff.md
+!/.agent/state/next-actions.md
+# END RAYKTO MANAGED

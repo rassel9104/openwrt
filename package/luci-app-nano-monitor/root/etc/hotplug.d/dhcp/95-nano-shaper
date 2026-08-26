@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+[ "$(uci -q get bwlimit.main.enabled)" = '1' ] || exit 0
+case "$ACTION" in add|update|del) /etc/init.d/nano-shaper reload >/dev/null 2>&1 ;; esac
+
+exit 0

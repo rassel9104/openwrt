@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+wan_network="$(uci -q get bwlimit.main.wan_network)"
+[ -n "$wan_network" ] || wan_network='provider'
+[ "$ACTION" = 'ifup' ] && [ "$INTERFACE" = "$wan_network" ] || exit 0
+/etc/init.d/nano-shaper reload >/dev/null 2>&1
+
+exit 0

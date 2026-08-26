@@ -1,0 +1,400 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+. /lib/functions.sh
+
+TABLE_FAMILY='inet'
+TABLE_NAME='nano_accounting'
+GATE_TABLE_NAME='nano_accounting_gate'
+RUN_DIR='/var/run/nano-accounting'
+STATE_DIR='/etc/nano-monitor'
+STATE_FILE="$STATE_DIR/daily-state"
+TZ='EST5EDT,M3.2.0,M11.1.0'
+export TZ
+
+is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+uint_add() {
+	awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", a + b }'
+}
+
+uint_ge() {
+	awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+uint_min() {
+	awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", (a < b ? a : b) }'
+}
+
+uint_between() {
+	awk -v n="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(n >= lo && n <= hi) }'
+}
+
+valid_iface() {
+	case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; *) return 0 ;; esac
+}
+
+valid_ipv4() {
+	local ip="$1" a b c d extra octet
+	case "$ip" in ''|*[!0-9.]*) return 1 ;; esac
+	IFS=. read -r a b c d extra <<EOF
+$ip
+EOF
+	[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] && [ -z "$extra" ] || return 1
+	for octet in "$a" "$b" "$c" "$d"; do
+		is_uint "$octet" && [ "$octet" -le 255 ] || return 1
+	done
+}
+
+add_priority_ip() {
+	valid_ipv4 "$1" || return
+	PRIORITY_SET="${PRIORITY_SET}${PRIORITY_SET:+, }$1"
+}
+
+write_runtime() {
+	local state="$1" message="$2"
+	mkdir -p "$RUN_DIR"
+	printf '%s\n' "$state" > "$RUN_DIR/state.tmp"
+	printf '%s\n' "$message" > "$RUN_DIR/message.tmp"
+	mv "$RUN_DIR/state.tmp" "$RUN_DIR/state"
+	mv "$RUN_DIR/message.tmp" "$RUN_DIR/message"
+}
+
+load_settings() {
+	local status value
+	config_load bwlimit
+	config_get_bool quota_enabled main quota_enabled 1
+	config_get quota_bytes main quota_bytes '2000000000'
+	config_get lan_if main lan_if 'br-lan'
+	config_get wan_network main wan_network 'provider'
+	config_get subnet main subnet '192.168.1.0/24'
+	config_get persist_interval main quota_persist_interval '1800'
+	config_get persist_step main quota_persist_step_bytes '64000000'
+	config_get reset_hour main quota_reset_hour '0'
+	config_get reset_minute main quota_reset_minute '1'
+	[ "$(uci -q get system.@system[0].zonename)" = 'America/New_York' ] || return 1
+	[ "$(uci -q get system.@system[0].timezone)" = "$TZ" ] || return 1
+
+	PRIORITY_SET=''
+	config_list_foreach main exempt_ip add_priority_ip
+	[ -n "$PRIORITY_SET" ] || return 1
+	for value in "$quota_bytes" "$persist_interval" "$persist_step" "$reset_hour" "$reset_minute"; do
+		is_uint "$value" || return 1
+	done
+	uint_between "$quota_bytes" 100000000 1000000000000 || return 1
+	[ "$persist_interval" -ge 60 ] && [ "$persist_step" -ge 1000000 ] || return 1
+	[ "$reset_hour" -le 23 ] && [ "$reset_minute" -le 59 ] || return 1
+	reset_at_minute=$((reset_hour * 60 + reset_minute))
+	valid_iface "$lan_if" && [ -d "/sys/class/net/$lan_if" ] || return 1
+	case "$subnet" in ''|*[!0-9./]*) return 1 ;; esac
+	status="$(ubus call "network.interface.$wan_network" status 2>/dev/null)"
+	wan_if="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	valid_iface "$wan_if" && [ -d "/sys/class/net/$wan_if" ] || return 1
+}
+
+state_value() {
+	local key="$1" value
+	[ -f "$STATE_FILE" ] || return
+	value="$(sed -n "s/^${key}=//p" "$STATE_FILE" 2>/dev/null | sed -n '1p')"
+	printf '%s' "$value"
+}
+
+counter_bytes() {
+	local name="$1" value
+	value="$(nft -j list counter "$TABLE_FAMILY" "$TABLE_NAME" "$name" 2>/dev/null | jsonfilter -e '@.nftables[*].counter.bytes' 2>/dev/null)"
+	is_uint "$value" || return 1
+	printf '%s' "$value"
+}
+
+quota_object_used() {
+	local value
+	value="$(nft -j list quota "$TABLE_FAMILY" "$TABLE_NAME" other_daily 2>/dev/null | jsonfilter -e '@.nftables[*].quota.used' 2>/dev/null)"
+	is_uint "$value" || return 1
+	printf '%s' "$value"
+}
+
+read_counters() {
+	internet_up="$(counter_bytes internet_up)" || return 1
+	internet_down="$(counter_bytes internet_down)" || return 1
+	priority_up="$(counter_bytes priority_up)" || return 1
+	priority_down="$(counter_bytes priority_down)" || return 1
+	others_up="$(counter_bytes others_up)" || return 1
+	others_down="$(counter_bytes others_down)" || return 1
+	quota_used="$(quota_object_used)" || return 1
+}
+
+load_saved_counters() {
+	local value name invalid=0
+	if [ ! -e "$STATE_FILE" ]; then
+		period_day=''
+		internet_up=0
+		internet_down=0
+		priority_up=0
+		priority_down=0
+		others_up=0
+		others_down=0
+		quota_used=0
+		return 0
+	fi
+	[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] || invalid=1
+	period_day="$(state_value day)"
+	case "$period_day" in ????-??-??) ;; *) invalid=1 ;; esac
+	for name in internet_up internet_down priority_up priority_down others_up others_down; do
+		value="$(state_value "$name")"
+		is_uint "$value" || { value=0; invalid=1; }
+		eval "$name=\$value"
+	done
+	quota_used="$(state_value quota_used)"
+	is_uint "$quota_used" || invalid=1
+	if [ "$invalid" != '0' ]; then
+		period_day="$(date +%F)"
+		quota_used="$quota_bytes"
+	fi
+}
+
+persist_values() {
+	local tmp="$STATE_FILE.tmp" saved key expected
+	mkdir -p -m 0700 "$STATE_DIR" || return 1
+	umask 077
+	{
+		printf 'day=%s\n' "$period_day"
+		printf 'internet_up=%s\n' "$internet_up"
+		printf 'internet_down=%s\n' "$internet_down"
+		printf 'priority_up=%s\n' "$priority_up"
+		printf 'priority_down=%s\n' "$priority_down"
+		printf 'others_up=%s\n' "$others_up"
+		printf 'others_down=%s\n' "$others_down"
+		printf 'quota_used=%s\n' "$quota_used"
+	} > "$tmp" && mv "$tmp" "$STATE_FILE" || return 1
+	sync || return 1
+	for key in day internet_up internet_down priority_up priority_down others_up others_down quota_used; do
+		if [ "$key" = 'day' ]; then
+			expected="$period_day"
+		else
+			eval "expected=\${$key}"
+		fi
+		saved="$(state_value "$key")"
+		[ "$saved" = "$expected" ] || return 1
+	done
+	last_persist_epoch="$(date +%s)"
+	last_persist_others="$quota_used"
+}
+
+persist_state() {
+	read_counters || return 1
+	persist_values
+}
+
+handle_persist_failure() {
+	quota_used="$quota_bytes"
+	if install_table >/dev/null 2>&1; then
+		blocked_saved=1
+		persistence_degraded=1
+		last_persist_epoch="$(date +%s)"
+		last_persist_others="$quota_used"
+		write_runtime error 'No se pudo guardar el estado; Otros queda bloqueado de forma preventiva.'
+	else
+		write_runtime error 'Falló la persistencia y no se pudo aplicar el bloqueo preventivo.'
+		return 1
+	fi
+}
+
+ensure_offloading_disabled() {
+	local changed=0 rules
+	# Daily forward counters require this invariant for the lifetime of the package.
+	# It is deliberately not restored during service restarts or failures.
+	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = '0' ] || {
+		uci -q set firewall.@defaults[0].flow_offloading='0' || return 1
+		changed=1
+	}
+	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = '0' ] || {
+		uci -q set firewall.@defaults[0].flow_offloading_hw='0' || return 1
+		changed=1
+	}
+	[ "$changed" = '0' ] || {
+		uci -q commit firewall || return 1
+	}
+	rules="$(nft list ruleset 2>/dev/null)" || return 1
+	if [ "$changed" != '0' ] || printf '%s\n' "$rules" | grep -Eq '(^|[[:space:]])flowtable[[:space:]]|flow add @'; then
+		/etc/init.d/firewall restart >/dev/null 2>&1 || return 1
+		rules="$(nft list ruleset 2>/dev/null)" || return 1
+	fi
+	printf '%s\n' "$rules" | grep -Eq '(^|[[:space:]])flowtable[[:space:]]|flow add @' && return 1
+	return 0
+}
+
+install_table() {
+	local quota_rule='' replace=''
+	[ "$quota_enabled" = '0' ] || quota_rule='quota name other_daily drop'
+	nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 && replace="delete table $TABLE_FAMILY $TABLE_NAME"
+	nft -f - <<EOF
+$replace
+table $TABLE_FAMILY $TABLE_NAME {
+	set priority_v4 {
+		type ipv4_addr
+		elements = { $PRIORITY_SET }
+	}
+	counter internet_up { packets 0 bytes $internet_up; }
+	counter internet_down { packets 0 bytes $internet_down; }
+	counter priority_up { packets 0 bytes $priority_up; }
+	counter priority_down { packets 0 bytes $priority_down; }
+	counter others_up { packets 0 bytes $others_up; }
+	counter others_down { packets 0 bytes $others_down; }
+	quota other_daily { over $quota_bytes bytes used $quota_used bytes; }
+
+	chain account {
+		type filter hook forward priority -6; policy accept;
+		iifname "$lan_if" oifname "$wan_if" ip saddr @priority_v4 counter name internet_up counter name priority_up
+		iifname "$lan_if" oifname "$wan_if" ip saddr $subnet ip saddr != @priority_v4 $quota_rule
+		iifname "$lan_if" oifname "$wan_if" ip saddr $subnet ip saddr != @priority_v4 counter name internet_up counter name others_up
+		iifname "$wan_if" oifname "$lan_if" ip daddr @priority_v4 counter name internet_down counter name priority_down
+		iifname "$wan_if" oifname "$lan_if" ip daddr $subnet ip daddr != @priority_v4 $quota_rule
+		iifname "$wan_if" oifname "$lan_if" ip daddr $subnet ip daddr != @priority_v4 counter name internet_down counter name others_down
+	}
+}
+EOF
+}
+
+install_reset_gate() {
+	local replace=''
+	nft list table "$TABLE_FAMILY" "$GATE_TABLE_NAME" >/dev/null 2>&1 && replace="delete table $TABLE_FAMILY $GATE_TABLE_NAME"
+	nft -f - <<EOF
+$replace
+table $TABLE_FAMILY $GATE_TABLE_NAME {
+	chain gate {
+		type filter hook forward priority -7; policy accept;
+		iifname "$lan_if" oifname "$wan_if" ip saddr $subnet drop
+		iifname "$wan_if" oifname "$lan_if" ip daddr $subnet drop
+	}
+}
+EOF
+}
+
+remove_reset_gate() {
+	nft list table "$TABLE_FAMILY" "$GATE_TABLE_NAME" >/dev/null 2>&1 || return 0
+	nft delete table "$TABLE_FAMILY" "$GATE_TABLE_NAME"
+}
+
+reset_period_if_due() {
+	local now_day now_minute now_hour
+	now_day="$(date +%F)"
+	now_hour="$(date +%H)"
+	now_minute="$(date +%M)"
+	now_hour="${now_hour#0}"
+	now_minute="${now_minute#0}"
+	[ -n "$now_hour" ] || now_hour=0
+	[ -n "$now_minute" ] || now_minute=0
+	now_minute=$((now_hour * 60 + now_minute))
+	if [ -z "$period_day" ]; then
+		period_day="$now_day"
+		return 0
+	fi
+	[ "$now_day" = "$period_day" ] && return 0
+	[ "$now_minute" -ge "$reset_at_minute" ] || return 0
+	reset_pending=1
+	# A separate earlier-priority gate closes the transition without replacing
+	# live counters. It remains fail-closed through any interrupted reset.
+	install_reset_gate || return 1
+	period_day="$now_day"
+	internet_up=0
+	internet_down=0
+	priority_up=0
+	priority_down=0
+	others_up=0
+	others_down=0
+	quota_used=0
+	# Commit the new period while the independent gate blocks LAN Internet.
+	persist_values || return 1
+	install_table || return 1
+	reset_pending=0
+	remove_reset_gate || return 1
+}
+
+cleanup() {
+	if [ "$reset_pending" = '1' ]; then
+		write_runtime error 'Reset diario interrumpido; el bloqueo de transición permanece para reintento.'
+		exit 1
+	fi
+	if nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
+		if ! persist_state >/dev/null 2>&1; then
+			write_runtime error 'No se pudo guardar el estado; la cuota permanece instalada.'
+			exit 1
+		fi
+	fi
+	remove_reset_gate >/dev/null 2>&1
+	nft delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null
+	write_runtime stopped 'Contabilidad detenida.'
+	exit 0
+}
+
+main() {
+	local now_epoch current_others blocked_saved=0 persistence_degraded=0
+	reset_pending=0
+	command -v nft >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 || {
+		write_runtime error 'Faltan nftables, jsonfilter o awk.'
+		exit 1
+	}
+	load_settings || {
+		write_runtime error 'Configuración o interfaz WAN no válida.'
+		exit 1
+	}
+	load_saved_counters
+	ensure_offloading_disabled || {
+		write_runtime error 'No se pudo desactivar flow offloading.'
+		exit 1
+	}
+	reset_period_if_due || {
+		write_runtime error 'No se pudo iniciar el periodo diario.'
+		exit 1
+	}
+	install_table || {
+		write_runtime error 'No se pudo instalar la contabilidad WAN.'
+		exit 1
+	}
+	remove_reset_gate || {
+		write_runtime error 'No se pudo retirar el bloqueo de transición.'
+		exit 1
+	}
+	persist_state || {
+		handle_persist_failure || exit 1
+	}
+	trap cleanup TERM INT
+	last_persist_epoch="$(date +%s)"
+	last_persist_others="$quota_used"
+	[ "$persistence_degraded" = '1' ] || write_runtime active 'Contabilidad diaria WAN verificada.'
+
+	while sleep 10; do
+		nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 || {
+			write_runtime error 'La tabla nftables desapareció; se reintentará el servicio.'
+			exit 1
+		}
+		reset_period_if_due || {
+			write_runtime error 'No se pudo completar de forma durable el reset diario.'
+			exit 1
+		}
+		read_counters || {
+			write_runtime error 'No se pudieron leer los objetos nftables.'
+			exit 1
+		}
+		now_epoch="$(date +%s)"
+		current_others="$quota_used"
+		if [ $((now_epoch - last_persist_epoch)) -ge "$persist_interval" ] ||
+			uint_ge "$(awk -v a="$current_others" -v b="$last_persist_others" 'BEGIN { printf "%.0f", a - b }')" "$persist_step"; then
+			if persist_state; then
+				persistence_degraded=0
+				write_runtime active 'Contabilidad diaria WAN verificada.'
+			else
+				handle_persist_failure || exit 1
+			fi
+		fi
+		if [ "$quota_enabled" = '1' ] && uint_ge "$current_others" "$quota_bytes" && [ "$blocked_saved" = '0' ]; then
+			persist_state || handle_persist_failure
+			blocked_saved=1
+		fi
+	done
+}
+
+main "$@"

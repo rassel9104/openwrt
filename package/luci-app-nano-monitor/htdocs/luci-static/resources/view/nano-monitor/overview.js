@@ -4,7 +4,6 @@
 'require rpc';
 'require poll';
 'require ui';
-'require uci';
 
 /* SPDX-License-Identifier: MIT
  * Copyright (C) 2026 RaykTo <raktodev@gmail.com>
@@ -22,14 +21,24 @@ var callStart = rpc.declare({
 	expect: { '': {} }
 });
 
-var callDevices = rpc.declare({
+var callAccounting = rpc.declare({
 	object: 'luci.nano-monitor',
-	method: 'devices',
+	method: 'accounting',
 	expect: { '': {} }
 });
 
-var previousCounters = {};
-var previousTime = 0;
+var callShaper = rpc.declare({
+	object: 'luci.nano-monitor',
+	method: 'shaper',
+	expect: { '': {} }
+});
+
+var callSetQuota = rpc.declare({
+	object: 'luci.nano-monitor',
+	method: 'set_quota',
+	params: [ 'quota_mb' ],
+	expect: { '': {} }
+});
 
 function setText(id, text) {
 	var node = document.getElementById(id);
@@ -100,85 +109,77 @@ function renderStatus(status) {
 	}
 }
 
-function parseLeases(raw) {
-	var byMac = {}, byIp = {};
-	(raw || '').split(/\n/).forEach(function(line) {
-		var fields = line.trim().split(/\s+/);
-		if (fields.length >= 4) {
-			var lease = { mac: fields[1].toLowerCase(), ip: fields[2], name: fields[3] === '*' ? '' : fields[3] };
-			byMac[lease.mac] = lease;
-			byIp[lease.ip] = lease;
-		}
-	});
-	return { byMac: byMac, byIp: byIp };
+function renderAccounting(response) {
+	var total = Number(response.internet_down) + Number(response.internet_up);
+	var priority = Number(response.priority_down) + Number(response.priority_up);
+	var others = Number(response.others_down) + Number(response.others_up);
+	var quota = Number(response.quota_bytes) || 1;
+	var used = Math.min(quota, Number(response.quota_used) || 0);
+	var progress = Math.min(100, used / quota * 100);
+	var blocked = response.blocked === '1';
+	var verified = response.verified === '1';
+
+	setText('nm-account-state', verified ? (blocked ? 'Otros bloqueados' : 'Contabilidad activa') : 'Requiere atención');
+	setText('nm-account-message', response.message || 'Esperando readback de nftables.');
+	setText('nm-daily-total', formatBytes(total));
+	setText('nm-daily-priority', formatBytes(priority));
+	setText('nm-daily-others', formatBytes(others));
+	setText('nm-quota-remaining', blocked ? '0 B · bloqueada' : formatBytes(Number(response.quota_remaining)));
+	setText('nm-quota-label', formatBytes(used) + ' de ' + formatBytes(quota) + ' · reinicio ' + (response.reset_at || '00:01') + ' ' + (response.timezone || 'hora local'));
+	var bar = document.getElementById('nm-quota-progress');
+	if (bar) {
+		bar.style.width = progress.toFixed(1) + '%';
+		bar.parentNode.setAttribute('aria-valuenow', progress.toFixed(0));
+		bar.classList.toggle('is-blocked', blocked);
+	}
+	var input = document.getElementById('nm-quota-input');
+	if (input && document.activeElement !== input)
+		input.value = Math.round(quota / 1000000);
 }
 
-function renderDevices(response) {
-	var body = document.getElementById('nm-devices-body');
-	var note = document.getElementById('nm-devices-note');
-	if (!body || !note)
-		return;
+function renderShaper(response) {
+	var active = response.verified === '1';
+	var priority = Array.isArray(response.priority_ips) ? response.priority_ips : [];
+	setText('nm-shaper-state', active ? 'Activo y verificado' : (response.enabled === '1' ? 'Requiere atención' : 'Desactivado'));
+	setText('nm-shaper-message', response.message || 'Esperando readback del servicio.');
+	setText('nm-shaper-total', formatRate(Number(response.total_down_kbit) * 1000) + ' ↓ · ' + formatRate(Number(response.total_up_kbit) * 1000) + ' ↑');
+	setText('nm-shaper-ordinary', formatRate(Number(response.effective_other_down_kbit) * 1000) + ' ↓ · ' + formatRate(Number(response.effective_other_up_kbit) * 1000) + ' ↑');
+	setText('nm-shaper-priority', priority.length + ' equipos · sin techo individual');
+	setText('nm-shaper-count', String(response.other_count || 0) + ' equipos conocidos');
+}
 
-	var payload;
-	try {
-		payload = JSON.parse(response.nlbw || '');
-		if (!Array.isArray(payload.columns) || !Array.isArray(payload.data))
-			throw new Error('shape');
+function applyQuota(button) {
+	var input = document.getElementById('nm-quota-input');
+	var quota = input ? Number(input.value) : NaN;
+	if (!Number.isInteger(quota) || quota < 100 || quota > 1000000) {
+		ui.addNotification(null, E('p', {}, 'Introduce una cuota entera entre 100 MB y 1.000.000 MB.'), 'error');
+		return Promise.resolve();
 	}
-	catch (e) {
-		body.replaceChildren();
-		note.textContent = response.error || (response.nlbw ? 'nlbwmon devolvió JSON no válido.' : 'nlbwmon está iniciando; vuelve a comprobar en unos segundos.');
-		previousCounters = {};
-		previousTime = 0;
-		return;
-	}
-
-	var columns = {}, leases = parseLeases(response.leases), now = Date.now(), rows = [];
-	payload.columns.forEach(function(name, index) { columns[name] = index; });
-	if (columns.ip == null || columns.mac == null || columns.rx_bytes == null || columns.tx_bytes == null) {
-		body.replaceChildren();
-		note.textContent = 'nlbwmon no entregó las columnas esperadas.';
-		return;
-	}
-
-	payload.data.forEach(function(record) {
-		var ip = String(record[columns.ip] || ''), mac = String(record[columns.mac] || '').toLowerCase();
-		var down = Number(record[columns.rx_bytes]) || 0, up = Number(record[columns.tx_bytes]) || 0;
-		var key = ip + '|' + mac, old = previousCounters[key], seconds = previousTime ? (now - previousTime) / 1000 : 0;
-		var downRate = old && seconds > 0 ? Math.max(0, down - old.down) / seconds : 0;
-		var upRate = old && seconds > 0 ? Math.max(0, up - old.up) / seconds : 0;
-		var lease = leases.byMac[mac] || leases.byIp[ip] || {};
-		rows.push({ key: key, ip: ip, mac: mac, name: lease.name || 'Sin nombre', down: down, up: up, downRate: downRate, upRate: upRate });
+	if (button)
+		button.disabled = true;
+	return callSetQuota(quota).then(function(result) {
+		if (result.verified !== '1')
+			throw new Error(result.error || 'La cuota no superó el readback.');
+		renderAccounting(result);
+		ui.addNotification(null, E('p', {}, 'Cuota diaria aplicada y verificada.'), 'info');
+	}).catch(function(error) {
+		ui.addNotification(null, E('p', {}, error.message || 'No se pudo aplicar la cuota.'), 'error');
+		return L.resolveDefault(callAccounting(), {}).then(renderAccounting);
+	}).finally(function() {
+		if (button)
+			button.disabled = false;
 	});
-
-	rows.sort(function(a, b) { return (b.down + b.up) - (a.down + a.up); });
-	var maxRate = rows.reduce(function(max, row) { return Math.max(max, row.downRate + row.upRate); }, 1);
-	body.replaceChildren.apply(body, rows.map(function(row) {
-		var speed = row.downRate + row.upRate;
-		return E('tr', {}, [
-			E('td', { 'data-title': 'Equipo' }, [ E('strong', {}, row.name), E('small', {}, row.ip + ' · ' + (row.mac || 'MAC desconocida')) ]),
-			E('td', { 'data-title': 'Descarga' }, formatBytes(row.down)),
-			E('td', { 'data-title': 'Subida' }, formatBytes(row.up)),
-			E('td', { 'data-title': 'Velocidad' }, [
-				E('span', {}, '↓ ' + formatBytes(row.downRate) + '/s · ↑ ' + formatBytes(row.upRate) + '/s'),
-				E('span', { 'class': 'nm-bar', 'aria-hidden': 'true' }, E('i', { 'style': 'width:' + Math.min(100, speed / maxRate * 100).toFixed(1) + '%' }))
-			])
-		]);
-	}));
-
-	previousCounters = {};
-	rows.forEach(function(row) { previousCounters[row.key] = { down: row.down, up: row.up }; });
-	previousTime = now;
-	note.textContent = rows.length ? 'Velocidad estimada entre consultas de 10 segundos.' : 'Todavía no hay equipos contabilizados.';
 }
 
 function refreshAll() {
 	return Promise.all([
 		L.resolveDefault(callStatus(), {}),
-		L.resolveDefault(callDevices(), { error: 'No se pudo consultar nlbwmon.' })
+		L.resolveDefault(callAccounting(), {}),
+		L.resolveDefault(callShaper(), {})
 	]).then(function(data) {
 		renderStatus(data[0]);
-		renderDevices(data[1]);
+		renderAccounting(data[1]);
+		renderShaper(data[2]);
 	});
 }
 
@@ -186,13 +187,13 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			L.resolveDefault(callStatus(), {}),
-			L.resolveDefault(callDevices(), { error: 'No se pudo consultar nlbwmon.' }),
-			uci.load('bwlimit')
+			L.resolveDefault(callAccounting(), {}),
+			L.resolveDefault(callShaper(), {})
 		]);
 	},
 
 	render: function(initial) {
-		var map = new form.Map('nano-monitor', 'Monitor Nano', 'Prueba pública iniciada por el propio Nano y consumo acumulado de la red local. Los resultados de velocidad son temporales y desaparecen al reiniciar.');
+		var map = new form.Map('nano-monitor', 'Monitor Nano', 'Velocidad pública y consumo diario exclusivamente de Internet. No se conserva historial de días anteriores.');
 		var section = map.section(form.NamedSection, 'main', 'nano-monitor', 'Medición pública');
 		var option;
 
@@ -221,16 +222,9 @@ return view.extend({
 			});
 		};
 
-		var downLimit = Number(uci.get('bwlimit', 'main', 'down_kbytes')) || 0;
-		var upLimit = Number(uci.get('bwlimit', 'main', 'up_kbytes')) || 0;
-		var limitsEnabled = uci.get('bwlimit', 'main', 'enabled') === '1';
-		var exempt = uci.get('bwlimit', 'main', 'exempt_ip') || [];
-		if (!Array.isArray(exempt))
-			exempt = [ exempt ];
-
 		var dashboard = E('div', { 'class': 'nm-shell' }, [
 			E('style', {}, '\
-.nm-shell{--nm-blue:#1677ff;--nm-green:#20a66a;--nm-ink:#172033;display:grid;gap:1rem;margin-top:1.2rem}.nm-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem}.nm-card{border:1px solid color-mix(in srgb,currentColor 14%,transparent);border-radius:12px;padding:1rem;background:color-mix(in srgb,var(--nm-blue) 4%,transparent)}.nm-card small,.nm-device small{display:block;opacity:.68;margin-top:.3rem}.nm-value{font-size:1.25rem;font-weight:700;color:var(--nm-ink)}.dark .nm-value{color:#eef4ff}.nm-state{display:flex;align-items:center;gap:.5rem}.nm-state:before{content:"";width:.65rem;height:.65rem;border-radius:50%;background:var(--nm-green)}.nm-errors{color:#b42318;min-height:1.2em}.nm-table-wrap{overflow-x:auto}.nm-table{width:100%}.nm-table td{vertical-align:middle}.nm-bar{display:block;width:100%;height:.32rem;margin-top:.45rem;border-radius:99px;background:color-mix(in srgb,currentColor 12%,transparent);overflow:hidden}.nm-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--nm-blue),var(--nm-green));border-radius:inherit}.nm-note{opacity:.7;margin:.5rem 0 0}@media(max-width:800px){.nm-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.nm-grid{grid-template-columns:1fr}.nm-table thead{display:none}.nm-table tr{display:block;border-bottom:1px solid color-mix(in srgb,currentColor 16%,transparent);padding:.5rem 0}.nm-table td{display:grid;grid-template-columns:6.5rem 1fr;border:0;padding:.35rem}.nm-table td:before{content:attr(data-title);font-weight:600;opacity:.7}}'),
+.nm-shell{--nm-blue:#1677ff;--nm-green:#20a66a;--nm-red:#d92d20;--nm-error:#b42318;--nm-text:var(--text-color-highest,#172033);--nm-muted:var(--text-color-high,#39465a);--nm-surface:var(--background-color-high,#fff);--nm-border:var(--border-color-medium,#d7e0eb);display:grid;gap:1.35rem;margin-top:1.2rem;color:var(--nm-text)}:root[data-darkmode="true"] .nm-shell{--nm-error:#ff8a80}.nm-shell h2{color:var(--nm-text);margin-bottom:.7rem}.nm-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem}.nm-card,.nm-quota{border:1px solid var(--nm-border);border-radius:14px;padding:1rem;background:color-mix(in srgb,var(--nm-blue) 6%,var(--nm-surface));box-shadow:0 1px 2px color-mix(in srgb,var(--nm-text) 9%,transparent)}.nm-card small,.nm-quota small{display:block;color:var(--nm-muted);opacity:1;margin-top:.3rem;line-height:1.4}.nm-value{font-size:1.25rem;font-weight:700;line-height:1.35;color:var(--nm-text)}.nm-state{display:flex;align-items:center;gap:.5rem}.nm-state:before{content:"";flex:0 0 auto;width:.65rem;height:.65rem;border-radius:50%;background:var(--nm-green);box-shadow:0 0 0 3px color-mix(in srgb,var(--nm-green) 18%,transparent)}.nm-errors{color:var(--nm-error);min-height:1.2em}.nm-quota{margin-top:.75rem}.nm-quota-head,.nm-quota-form{display:flex;align-items:end;justify-content:space-between;gap:1rem;flex-wrap:wrap}.nm-meter{height:.6rem;margin:.8rem 0 .7rem;border-radius:99px;background:var(--border-color-high,#d8e0ea);overflow:hidden}.nm-meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--nm-blue),var(--nm-green));transition:width .25s ease}.nm-meter i.is-blocked{background:var(--nm-red)}.nm-quota-form label{display:grid;gap:.3rem;font-weight:600;color:var(--nm-text)}.nm-quota-form input{max-width:11rem;color:var(--nm-text);background:var(--nm-surface);border-color:var(--nm-border)}.nm-note{color:var(--nm-muted);opacity:1;line-height:1.55;margin:.6rem 0 0}@media(max-width:800px){.nm-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.nm-grid{grid-template-columns:1fr}.nm-quota-form>*{width:100%}.nm-quota-form input{max-width:none}}'),
 			E('section', { 'aria-labelledby': 'nm-speed-title' }, [
 				E('h2', { 'id': 'nm-speed-title' }, 'Última prueba'),
 				E('div', { 'class': 'nm-grid' }, [
@@ -241,16 +235,32 @@ return view.extend({
 				]),
 				E('p', { 'id': 'nm-errors', 'class': 'nm-errors', 'role': 'status' }, '')
 			]),
-			E('section', { 'aria-labelledby': 'nm-devices-title' }, [
-				E('h2', { 'id': 'nm-devices-title' }, 'Consumo por equipo'),
-				E('p', { 'class': 'nm-note' }, limitsEnabled
-					? 'Límite agregado activo: ↓ ' + formatRate(downLimit * 8000) + ' · ↑ ' + formatRate(upLimit * 8000) + (exempt.length ? ' · Exentos: ' + exempt.join(', ') : '')
-					: 'El límite agregado bwlimit está desactivado.'),
-				E('div', { 'class': 'nm-table-wrap' }, E('table', { 'class': 'table nm-table' }, [
-					E('thead', {}, E('tr', {}, [ E('th', {}, 'Equipo'), E('th', {}, 'Descarga acumulada'), E('th', {}, 'Subida acumulada'), E('th', {}, 'Velocidad actual') ])),
-					E('tbody', { 'id': 'nm-devices-body' })
-				])),
-				E('p', { 'id': 'nm-devices-note', 'class': 'nm-note', 'role': 'status' }, '')
+			E('section', { 'aria-labelledby': 'nm-account-title' }, [
+				E('h2', { 'id': 'nm-account-title' }, 'Internet de hoy'),
+				E('div', { 'class': 'nm-grid' }, [
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Estado'), E('div', { 'id': 'nm-account-state', 'class': 'nm-value nm-state', 'aria-live': 'polite' }, '—'), E('small', { 'id': 'nm-account-message' }, '') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Total · subida + descarga'), E('div', { 'id': 'nm-daily-total', 'class': 'nm-value' }, '—') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'PC + teléfono'), E('div', { 'id': 'nm-daily-priority', 'class': 'nm-value' }, '—'), E('small', {}, 'No reduce la cuota') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Otros'), E('div', { 'id': 'nm-daily-others', 'class': 'nm-value' }, '—'), E('small', {}, 'Sí reduce la cuota') ])
+				]),
+				E('div', { 'class': 'nm-quota' }, [
+					E('div', { 'class': 'nm-quota-head' }, [ E('div', {}, [ E('small', {}, 'Disponible para Otros'), E('div', { 'id': 'nm-quota-remaining', 'class': 'nm-value' }, '—') ]), E('small', { 'id': 'nm-quota-label' }, '—') ]),
+					E('div', { 'class': 'nm-meter', 'role': 'progressbar', 'aria-label': 'Cuota diaria consumida', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': '0' }, E('i', { 'id': 'nm-quota-progress' })),
+					E('div', { 'class': 'nm-quota-form' }, [
+						E('label', {}, [ 'Cuota diaria (MB)', E('input', { 'id': 'nm-quota-input', 'type': 'number', 'min': '100', 'max': '1000000', 'step': '100', 'inputmode': 'numeric' }) ]),
+						E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-apply', 'click': function(ev) { return applyQuota(ev.currentTarget); } }, 'Aplicar cuota')
+					])
+				])
+			]),
+			E('section', { 'aria-labelledby': 'nm-shaper-title' }, [
+				E('h2', { 'id': 'nm-shaper-title' }, 'Prioridad de red'),
+				E('div', { 'class': 'nm-grid' }, [
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Estado efectivo'), E('div', { 'id': 'nm-shaper-state', 'class': 'nm-value nm-state' }, '—'), E('small', { 'id': 'nm-shaper-message' }, '') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Techo administrado'), E('div', { 'id': 'nm-shaper-total', 'class': 'nm-value' }, '—') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Mínimo por cada Otro'), E('div', { 'id': 'nm-shaper-ordinary', 'class': 'nm-value' }, '—') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Equipos prioritarios'), E('div', { 'id': 'nm-shaper-priority', 'class': 'nm-value' }, '—'), E('small', { 'id': 'nm-shaper-count' }, '—') ])
+				]),
+				E('p', { 'class': 'nm-note' }, 'PC y teléfono pueden usar el techo disponible sin límite individual. Cada equipo de Otros recibe su propia clase cuando aparece en DHCP; si hay más equipos de los que admite el enlace, el mínimo efectivo se ajusta y se muestra aquí.')
 			])
 		]);
 
@@ -260,7 +270,8 @@ return view.extend({
 				if (startButton)
 					startButton.setAttribute('data-nano-start', '1');
 				renderStatus(initial[0]);
-				renderDevices(initial[1]);
+				renderAccounting(initial[1]);
+				renderShaper(initial[2]);
 				poll.add(refreshAll, 10);
 			}, 0);
 			return E([ formNode, dashboard ]);
