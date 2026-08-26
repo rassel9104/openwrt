@@ -27,12 +27,13 @@ last_updated: 2026-08-26
 - Radio preservada: país `00`, canal `167`, `HT20`, BSSID `6C:3B:6B:76:7B:85`.
 - Pasaron sintaxis shell/JavaScript, `git diff --check`, build OpenWrt, inspección IPK y revisión focal final `PASS`.
 - `recovery-kit/` continúa local, excluido de Git y no debe publicarse.
+- Commit `5610376d924` publicado en `fork/nano-m5-upper-5ghz`.
 
 ## Open decision / acceptance boundary
 - No quedan decisiones funcionales abiertas. La presentación actualizada queda disponible para confirmación visual del owner en LuCI.
 
 ## Next safe action
-- Crear el commit de cierre y publicar la rama autorizada.
+- Ninguna acción funcional requerida; sólo confirmación visual opcional del owner en LuCI.
 
 ## Active references
 - `package/luci-app-nano-monitor/`

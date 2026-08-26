@@ -10,8 +10,8 @@
 
 ## Next
 - [x] Build, IPK y correcciones runtime revisadas con resultado `PASS`.
-- [ ] Crear commit único de cierre.
-- [ ] Publicar `nano-m5-upper-5ghz` en el fork autorizado.
+- [x] Commit funcional `5610376d924` creado con autoría RaykTo.
+- [x] Rama `nano-m5-upper-5ghz` publicada en el fork autorizado.
 
 ## Waiting / parked
 - [ ] Confirmación visual opcional del texto actualizado en LuCI.
