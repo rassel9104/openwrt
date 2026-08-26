@@ -2,7 +2,63 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
-[ "$(uci -q get bwlimit.main.enabled)" = '1' ] || exit 0
-case "$ACTION" in add|update|del) /etc/init.d/nano-shaper reload >/dev/null 2>&1 ;; esac
+reconcile() {
+	lock_file='/var/run/nano-reconcile.lock'
+	pending='/var/run/nano-reconcile.pending'
+	command -v flock >/dev/null 2>&1 || return 1
+	[ ! -L "$lock_file" ] && [ ! -L "$pending" ] || return 1
+	# Publish intent before trying the lock. If the current owner consumes this
+	# marker, its following pass includes our event; otherwise we become owner or
+	# leave a marker that the owner observes after unlock.
+	: > "$pending" || return 1
+	exec 9>"$lock_file" || return 1
+	if ! flock -n 9; then
+		: > "$pending"
+		exec 9>&-
+		return 0
+	fi
+	trap 'flock -u 9; exec 9>&-; exit 1' 1 2 15
+	rc=0
+	accounting_ready=0
+	while :; do
+		rm -f "$pending"
+		accounting_ready=0
+		mkdir -p /var/run/nano-accounting
+		printf '%s\n' restarting > /var/run/nano-accounting/state
+		printf 'pid=%s\n' "$$" > /var/run/nano-accounting/handoff
+		/etc/init.d/nano-accounting stop 9>&- >/dev/null 2>&1 && /etc/init.d/nano-accounting start 9>&- >/dev/null 2>&1 || { rc=1; break; }
+		attempt=0
+		while [ "$attempt" -lt 10 ] && [ "$(cat /var/run/nano-accounting/state 2>/dev/null)" != 'active' ]; do
+			attempt=$((attempt + 1))
+			sleep 1
+		done
+		if [ "$(cat /var/run/nano-accounting/state 2>/dev/null)" != 'active' ]; then rc=1; break; fi
+		accounting_ready=1
+		if [ "$(uci -q get bwlimit.main.enabled)" = '1' ]; then
+			/etc/init.d/nano-shaper reload 9>&- >/dev/null 2>&1 || { rc=1; break; }
+		fi
+		[ -e "$pending" ] || break
+	done
+	if [ "$rc" -ne 0 ] && [ "$accounting_ready" = '0' ]; then
+		rm -f /var/run/nano-accounting/handoff
+		/etc/init.d/nano-accounting stop 9>&- >/dev/null 2>&1
+	fi
+	flock -u 9
+	exec 9>&-
+	trap - 1 2 15
+	# Close the only lock-release race: an event that observed the old lock
+	# leaves pending; after unlock it is either handled here or owns a new lock.
+	if [ -e "$pending" ]; then
+		rm -f "$pending"
+		"$0" reconcile || rc=1
+	fi
+	return "$rc"
+}
 
-exit 0
+case "${1:-$ACTION}" in
+	reconcile|add|update|del)
+		reconcile
+		;;
+esac
+
+exit $?

@@ -2,9 +2,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
-START=94
+START=50
 STOP=11
 USE_PROCD=1
+
+pid_is() {
+	local pid="$1" needle="$2" cmdline
+	[ "$pid" -gt 1 ] && [ -r "/proc/$pid/cmdline" ] || return 1
+	cmdline="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+	printf '%s\n' "$cmdline" | grep -Fq "$needle"
+}
+
+mark_orphan_dirty() {
+	local dir='/etc/nano-monitor' file='/etc/nano-monitor/accounting-dirty'
+	mkdir -p -m 0700 "$dir" || return 1
+	[ ! -L "$dir" ] && [ ! -L "$file" ] || return 1
+	umask 077
+	printf 'pid=0\n' > "$file.tmp" && mv "$file.tmp" "$file" && sync
+}
 
 start_service() {
 	procd_open_instance
@@ -15,7 +30,41 @@ start_service() {
 	procd_close_instance
 }
 
+stop_service() {
+	local pid handoff_pid
+	# If no daemon remains, clean a signed orphan unless an explicit successor
+	# currently owns the handoff. A live daemon persists/deletes in its TERM trap.
+	if [ -f /var/run/nano-accounting/handoff ]; then
+		handoff_pid="$(sed -n 's/^pid=//p' /var/run/nano-accounting/handoff 2>/dev/null | sed -n '1p')"
+		case "$handoff_pid" in ''|*[!0-9]*) handoff_pid=0 ;; esac
+		if pid_is "$handoff_pid" '/etc/hotplug.d/dhcp/95-nano-shaper'; then return 0; fi
+		rm -f /var/run/nano-accounting/handoff
+	fi
+	pid="$(sed -n 's/^pid=//p' /etc/nano-monitor/accounting-dirty 2>/dev/null | sed -n '1p')"
+	case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+	pid_is "$pid" '/usr/libexec/nano-monitor/accounting-daemon' && return 0
+	if nft list table inet nano_accounting >/dev/null 2>&1; then
+		nft list table inet nano_accounting 2>/dev/null | grep -Fq 'comment "nano-monitor-accounting-v1"' || return 1
+		# No daemon can persist the final delta. Mark the session unclean before
+		# deletion so the next start consumes the reserved recovery allowance.
+		mark_orphan_dirty || return 1
+		nft delete table inet nano_accounting >/dev/null 2>&1 || return 1
+		nft list table inet nano_accounting >/dev/null 2>&1 && return 1
+	fi
+}
+
+restart() {
+	/etc/hotplug.d/dhcp/95-nano-shaper reconcile
+}
+
+reload_service() {
+	/etc/hotplug.d/dhcp/95-nano-shaper reconcile >/dev/null 2>&1 &
+}
+
 service_triggers() {
-	procd_add_reload_trigger bwlimit firewall
-	procd_add_interface_trigger 'interface.*.up' 'provider' /etc/init.d/nano-accounting restart
+	local wan_network
+	config_load bwlimit
+	config_get wan_network main wan_network 'provider'
+	procd_add_reload_trigger bwlimit dhcp firewall
+	procd_add_interface_trigger 'interface.*.up' "$wan_network" /etc/hotplug.d/dhcp/95-nano-shaper reconcile
 }

@@ -12,6 +12,12 @@ HELPER='/usr/libexec/nano-monitor/run-speedtest'
 SHAPER_STATE_DIR='/var/run/nano-shaper'
 ACCOUNT_STATE_DIR='/var/run/nano-accounting'
 ACCOUNT_PERSIST='/etc/nano-monitor/daily-state'
+DEVICE_REGISTRY='/usr/libexec/nano-monitor/device-registry'
+RECONCILE='/etc/hotplug.d/dhcp/95-nano-shaper'
+WAN_HANDLE=1001
+LAN_HANDLE=1002
+OWNER_CLASS=4095
+SLOW_OFFSET=1000
 
 is_uint() {
 	case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
@@ -160,44 +166,57 @@ nft_counter_bytes() {
 }
 
 nft_quota_used() {
-	local value
-	value="$(nft -j list quota inet nano_accounting other_daily 2>/dev/null | jsonfilter -e '@.nftables[*].quota.used' 2>/dev/null)"
+	local id="$1" value
+	case "$id" in ????????????) ;; *) return 1 ;; esac
+	value="$(nft -j list quota inet nano_accounting "q_$id" 2>/dev/null | jsonfilter -e '@.nftables[*].quota.used' 2>/dev/null)"
 	is_uint "$value" || return 1
 	printf '%s' "$value"
 }
 
 nft_quota_bytes() {
-	local value
-	value="$(nft -j list quota inet nano_accounting other_daily 2>/dev/null | jsonfilter -e '@.nftables[*].quota.bytes' 2>/dev/null)"
+	local id="$1" value
+	case "$id" in ????????????) ;; *) return 1 ;; esac
+	value="$(nft -j list quota inet nano_accounting "q_$id" 2>/dev/null | jsonfilter -e '@.nftables[*].quota.bytes' 2>/dev/null)"
 	is_uint "$value" || return 1
 	printf '%s' "$value"
 }
 
 runtime_accounting_ok() {
-	local rules lan_if wan_network wan_if ip quota_enabled expected="$1" actual
+	local rules lan_if wan_network wan_if ip expected="$1" actual configured registry tab id mac name
 	[ "$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)" = 'active' ] || return 1
 	config_load bwlimit
+	[ "$(uci -q get bwlimit.main.quota_enabled)" = '1' ] || return 1
 	config_get lan_if main lan_if 'br-lan'
 	config_get wan_network main wan_network 'provider'
-	config_get_bool quota_enabled main quota_enabled 1
+	config_get configured main quota_per_device_bytes '700000000'
+	[ -n "$expected" ] && configured="$expected"
+	is_uint "$configured" || return 1
 	wan_if="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	rules="$(nft list table inet nano_accounting 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" | grep -Fq 'comment "nano-monitor-accounting-v1"' || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$lan_if\" oifname \"$wan_if\"" || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$wan_if\" oifname \"$lan_if\"" || return 1
-	[ "$quota_enabled" = '0' ] || printf '%s\n' "$rules" | grep -Fq 'quota name other_daily drop' || return 1
 	for ip in $(uci -q get bwlimit.main.exempt_ip); do
 		printf '%s\n' "$rules" | grep -Fq "$ip" || return 1
 	done
+	[ -x "$DEVICE_REGISTRY" ] || return 1
+	registry="$($DEVICE_REGISTRY)" || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		actual="$(nft_quota_bytes "$id")" || return 1
+		[ "$actual" = "$configured" ] || return 1
+		printf '%s\n' "$rules" | grep -Fq "q_$id" || return 1
+	done <<EOF
+$registry
+EOF
 	[ "$(uci -q get system.@system[0].zonename)" = 'America/New_York' ] || return 1
 	[ "$(uci -q get system.@system[0].timezone)" = 'EST5EDT,M3.2.0,M11.1.0' ] || return 1
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = '0' ] || return 1
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = '0' ] || return 1
 	effective_flow_offloading_disabled || return 1
-	nft_quota_used >/dev/null || return 1
 	if [ -n "$expected" ]; then
-		[ "$(uci -q get bwlimit.main.quota_bytes)" = "$expected" ] || return 1
-		actual="$(nft_quota_bytes)" || return 1
-		[ "$actual" = "$expected" ] || return 1
+		[ "$(uci -q get bwlimit.main.quota_per_device_bytes)" = "$expected" ] || return 1
 	fi
 }
 
@@ -213,18 +232,19 @@ wait_accounting_quota() {
 
 restore_quota_value() {
 	local value="$1"
-	uci -q set bwlimit.main.quota_bytes="$value" || return 1
+	uci -q set bwlimit.main.quota_per_device_bytes="$value" || return 1
 	uci -q commit bwlimit || return 1
-	[ "$(uci -q get bwlimit.main.quota_bytes)" = "$value" ] || return 1
-	/etc/init.d/nano-accounting restart >/dev/null 2>&1 || return 1
+	[ "$(uci -q get bwlimit.main.quota_per_device_bytes)" = "$value" ] || return 1
+	"$RECONCILE" reconcile >/dev/null 2>&1 || return 1
 	wait_accounting_quota "$value"
 }
 
 method_accounting() {
-	local internet_up internet_down priority_up priority_down others_up others_down quota_bytes quota_enabled quota_used remaining blocked verified period_day timezone reset_hour reset_minute reset_at data_ok=1 value
+	local internet_up internet_down priority_up priority_down others_up others_down quota_bytes quota_enabled quota_used remaining verified period_day timezone reset_hour reset_minute reset_at data_ok=1 value registry tab id mac ip name used left degraded device_count capacity degraded_count
 	config_load bwlimit
 	config_get_bool quota_enabled main quota_enabled 1
-	config_get quota_bytes main quota_bytes '2000000000'
+	[ "$quota_enabled" = '1' ] || data_ok=0
+	config_get quota_bytes main quota_per_device_bytes '700000000'
 	config_get reset_hour main quota_reset_hour '0'
 	config_get reset_minute main quota_reset_minute '1'
 	internet_up="$(nft_counter_bytes internet_up)" || data_ok=0
@@ -233,13 +253,27 @@ method_accounting() {
 	priority_down="$(nft_counter_bytes priority_down)" || data_ok=0
 	others_up="$(nft_counter_bytes others_up)" || data_ok=0
 	others_down="$(nft_counter_bytes others_down)" || data_ok=0
-	quota_used="$(nft_quota_used)" || data_ok=0
-	for value in internet_up internet_down priority_up priority_down others_up others_down quota_used; do
+	for value in internet_up internet_down priority_up priority_down others_up others_down; do
 		eval "[ -n \"\${$value}\" ] || $value=0"
 	done
-	remaining="$(uint_sub_floor "$quota_bytes" "$quota_used")"
-	blocked='0'
-	[ "$quota_enabled" = '0' ] || ! uint_ge "$quota_used" "$quota_bytes" || blocked='1'
+	registry="$($DEVICE_REGISTRY 2>/dev/null)" || { registry=''; data_ok=0; }
+	quota_used=0
+	remaining=0
+	device_count=0
+	degraded_count=0
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		used="$(nft_quota_used "$id")" || { used=0; data_ok=0; }
+		left="$(uint_sub_floor "$quota_bytes" "$used")"
+		quota_used="$(awk -v a="$quota_used" -v b="$used" 'BEGIN { printf "%.0f", a + b }')"
+		remaining="$(awk -v a="$remaining" -v b="$left" 'BEGIN { printf "%.0f", a + b }')"
+		device_count=$((device_count + 1))
+		uint_ge "$used" "$quota_bytes" && degraded_count=$((degraded_count + 1))
+	done <<EOF
+$registry
+EOF
+	capacity="$(uint_mul "$quota_bytes" "$device_count")"
 	verified='0'
 	[ "$data_ok" = '1' ] && runtime_accounting_ok && verified='1'
 	period_day="$(sed -n 's/^day=//p' "$ACCOUNT_PERSIST" 2>/dev/null | sed -n '1p')"
@@ -257,15 +291,39 @@ method_accounting() {
 	json_add_string reset_at "$reset_at"
 	json_add_string quota_enabled "$quota_enabled"
 	json_add_string quota_bytes "$quota_bytes"
+	json_add_string quota_capacity "$capacity"
 	json_add_string quota_used "$quota_used"
 	json_add_string quota_remaining "$remaining"
-	json_add_string blocked "$blocked"
+	json_add_string blocked '0'
+	json_add_string degraded_count "$degraded_count"
+	json_add_string device_count "$device_count"
 	json_add_string internet_up "$internet_up"
 	json_add_string internet_down "$internet_down"
 	json_add_string priority_up "$priority_up"
 	json_add_string priority_down "$priority_down"
 	json_add_string others_up "$others_up"
 	json_add_string others_down "$others_down"
+	json_add_array devices
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		used="$(nft_quota_used "$id" 2>/dev/null)"
+		is_uint "$used" || used=0
+		left="$(uint_sub_floor "$quota_bytes" "$used")"
+		degraded='0'
+		uint_ge "$used" "$quota_bytes" && degraded='1'
+		json_add_object ''
+		json_add_string id "$id"
+		json_add_string mac "$mac"
+		json_add_string ip "$ip"
+		json_add_string name "$name"
+		json_add_string used "$used"
+		json_add_string remaining "$left"
+		json_add_string degraded "$degraded"
+		json_close_object
+	done <<EOF
+$registry
+EOF
+	json_close_array
 	json_dump
 	json_cleanup
 }
@@ -278,6 +336,13 @@ tc_class_value_matches() {
 	local dev="$1" classid="$2" field="$3" expected="$4" actual
 	actual="$(tc -j class show dev "$dev" classid "$classid" 2>/dev/null | jsonfilter -e "@[0].$field" 2>/dev/null)"
 	[ "$actual" = "$expected" ]
+}
+
+tc_root_default_ok() {
+	local dev="$1" handle="$2" root
+	root="$(tc qdisc show dev "$dev" 2>/dev/null | sed -n "/qdisc htb $handle: root/{p;q;}")"
+	[ -n "$root" ] || return 1
+	printf '%s\n' "$root" | grep -Eq 'default (20|0x20)( |$)'
 }
 
 collect_rpc_reservation() {
@@ -303,7 +368,7 @@ rpc_add_other_ip() {
 }
 
 runtime_reservations_ok() {
-	local priority_ips ip valid=1
+	local priority_ips ip valid=1 registry tab id mac name
 	priority_ips="$(uci -q get bwlimit.main.exempt_ip)"
 	[ -n "$priority_ips" ] || return 1
 	RPC_PRIORITY_IPS="$priority_ips"
@@ -311,14 +376,17 @@ runtime_reservations_ok() {
 	RPC_OTHER_IPS=''
 	config_load dhcp
 	config_foreach collect_rpc_reservation host
-	if [ -r /tmp/dhcp.leases ]; then
-		while read -r _expires _mac ip _name _client; do
-			rpc_add_other_ip "$ip"
-		done < /tmp/dhcp.leases
-	fi
 	for ip in $priority_ips; do
 		case "$RPC_RESERVED_IPS" in *" $ip "*) ;; *) valid=0 ;; esac
 	done
+	[ -x "$DEVICE_REGISTRY" ] || return 1
+	registry="$($DEVICE_REGISTRY)" || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] || rpc_add_other_ip "$ip"
+	done <<EOF
+$registry
+EOF
 	config_load bwlimit
 	[ "$valid" = '1' ]
 }
@@ -348,26 +416,32 @@ rpc_filter_mapping_matches() {
 }
 
 rpc_other_classes_ok() {
-	local dev="$1" handle="$2" direction="$3" rate="$4" ip classid=101
+	local dev="$1" handle="$2" normal="$3" degraded="$4" ip normal_id=101 slow_id=$((101 + SLOW_OFFSET))
 	for ip in $RPC_OTHER_IPS; do
-		tc class show dev "$dev" | grep -q "class htb $handle:$classid" || return 1
-		tc qdisc show dev "$dev" | grep -q "qdisc fq_codel $handle$classid:" || return 1
-		tc_class_value_matches "$dev" "$handle:$classid" rate $((rate * 125)) || return 1
-		rpc_filter_mapping_matches "$dev" "$handle" "$classid" "$direction" "$ip" || return 1
-		classid=$((classid + 1))
+		tc_class_value_matches "$dev" "$handle:$normal_id" rate 125 || return 1
+		tc_class_value_matches "$dev" "$handle:$normal_id" ceil $((normal * 125)) || return 1
+		tc_class_value_matches "$dev" "$handle:$slow_id" rate 125 || return 1
+		tc_class_value_matches "$dev" "$handle:$slow_id" ceil $((degraded * 125)) || return 1
+		tc qdisc show dev "$dev" | grep -q "qdisc fq_codel $normal_id:" || return 1
+		tc qdisc show dev "$dev" | grep -q "qdisc fq_codel $slow_id:" || return 1
+		normal_id=$((normal_id + 1))
+		slow_id=$((slow_id + 1))
 	done
 }
 
 runtime_shaper_ok() {
-	local total_down total_up effective_down effective_up wan_if lan_if wan_network current_wan rules ip
+	local total_down total_up effective_down effective_up degraded priority_down priority_up wan_if lan_if wan_network current_wan rules account_rules ip id registry tab mac name normal_id slow_id
 	config_load bwlimit
 	config_get lan_if main lan_if 'br-lan'
 	config_get wan_network main wan_network 'provider'
 	config_get total_down main total_down_kbit
 	config_get total_up main total_up_kbit
+	config_get degraded main other_degraded_kbit '64'
 	effective_down="$(cat "$SHAPER_STATE_DIR/other_down_kbit" 2>/dev/null)"
 	effective_up="$(cat "$SHAPER_STATE_DIR/other_up_kbit" 2>/dev/null)"
-	[ -n "$total_down" ] && [ -n "$total_up" ] && [ -n "$effective_down" ] && [ -n "$effective_up" ] || return 1
+	priority_down="$(cat "$SHAPER_STATE_DIR/priority_down_kbit" 2>/dev/null)"
+	priority_up="$(cat "$SHAPER_STATE_DIR/priority_up_kbit" 2>/dev/null)"
+	[ -n "$total_down" ] && [ -n "$total_up" ] && [ -n "$effective_down" ] && [ -n "$effective_up" ] && [ -n "$degraded" ] && [ -n "$priority_down" ] && [ -n "$priority_up" ] || return 1
 	[ "$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)" = 'active' ] || return 1
 	wan_if="$(cat "$SHAPER_STATE_DIR/wan_if" 2>/dev/null)"
 	case "$wan_if:$lan_if:$wan_network" in *[!A-Za-z0-9_.:-]*) return 1 ;; esac
@@ -375,39 +449,67 @@ runtime_shaper_ok() {
 	[ "$current_wan" = "$wan_if" ] || return 1
 	command -v tc >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 || return 1
 	runtime_reservations_ok || return 1
-	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc htb 1: root' || return 1
-	tc_class_value_matches "$wan_if" 1:1 ceil $((total_up * 125)) || return 1
-	tc_class_value_matches "$wan_if" 1:20 rate $((effective_up * 125)) || return 1
-	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc fq_codel 110:' || return 1
-	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc fq_codel 120:' || return 1
-	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc htb 2: root' || return 1
-	tc_class_value_matches "$lan_if" 2:1 ceil $((total_down * 125)) || return 1
-	tc_class_value_matches "$lan_if" 2:20 rate $((effective_down * 125)) || return 1
-	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 210:' || return 1
-	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 220:' || return 1
-	rpc_other_classes_ok "$wan_if" 1 src "$effective_up" || return 1
-	rpc_other_classes_ok "$lan_if" 2 dst "$effective_down" || return 1
+	! nft list table inet nano_shaper_gate >/dev/null 2>&1 || return 1
+	tc_root_default_ok "$wan_if" "$WAN_HANDLE" || return 1
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:1" ceil $((total_up * 125)) || return 1
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:$OWNER_CLASS" rate 125 || return 1
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:10" rate $((priority_up * 125)) || return 1
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:10" ceil $((total_up * 125)) || return 1
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:20" rate 125 || return 1
+	tc_class_value_matches "$wan_if" "$WAN_HANDLE:20" ceil $((degraded * 125)) || return 1
+	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc fq_codel 10:' || return 1
+	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc fq_codel 20:' || return 1
+	tc_root_default_ok "$lan_if" "$LAN_HANDLE" || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:1" ceil $((total_down * 125)) || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:$OWNER_CLASS" rate 125 || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:10" rate $((priority_down * 125)) || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:10" ceil $((total_down * 125)) || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:20" rate 125 || return 1
+	tc_class_value_matches "$lan_if" "$LAN_HANDLE:20" ceil $((degraded * 125)) || return 1
+	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 10:' || return 1
+	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 20:' || return 1
+	rpc_other_classes_ok "$wan_if" "$WAN_HANDLE" "$effective_up" "$degraded" || return 1
+	rpc_other_classes_ok "$lan_if" "$LAN_HANDLE" "$effective_down" "$degraded" || return 1
 	rules="$(nft list table inet nano_shaper 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" | grep -Fq 'comment "nano-monitor-owned-v1"' || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$lan_if\" oifname \"$wan_if\"" || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$wan_if\" oifname \"$lan_if\"" || return 1
-	printf '%s\n' "$rules" | grep -Fq 'meta priority set 1:10' || return 1
-	printf '%s\n' "$rules" | grep -Fq 'meta priority set 2:10' || return 1
+	printf '%s\n' "$rules" | grep -Fq "meta priority set $WAN_HANDLE:10" || return 1
+	printf '%s\n' "$rules" | grep -Fq "meta priority set $LAN_HANDLE:10" || return 1
 	for ip in $(uci -q get bwlimit.main.exempt_ip); do
 		printf '%s\n' "$rules" | grep -Fq "$ip" || return 1
 	done
+	account_rules="$(nft list table inet nano_accounting 2>/dev/null)" || return 1
+	printf '%s\n' "$account_rules" | grep -Fq 'comment "nano-monitor-accounting-v1"' || return 1
+	registry="$($DEVICE_REGISTRY)" || return 1
+	tab="$(printf '\t')"
+	normal_id=101
+	slow_id=$((101 + SLOW_OFFSET))
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		printf '%s\n' "$account_rules" | grep -F "ip saddr $ip" | grep -Fq "meta priority set $WAN_HANDLE:$normal_id" || return 1
+		printf '%s\n' "$account_rules" | grep -F "ip saddr $ip" | grep -Fq "meta priority set $WAN_HANDLE:$slow_id" || return 1
+		printf '%s\n' "$account_rules" | grep -F "ip daddr $ip" | grep -Fq "meta priority set $LAN_HANDLE:$normal_id" || return 1
+		printf '%s\n' "$account_rules" | grep -F "ip daddr $ip" | grep -Fq "meta priority set $LAN_HANDLE:$slow_id" || return 1
+		normal_id=$((normal_id + 1))
+		slow_id=$((slow_id + 1))
+	done <<EOF
+$registry
+EOF
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = '0' ] || return 1
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = '0' ] || return 1
 	effective_flow_offloading_disabled || return 1
 }
 
 method_shaper() {
-	local enabled state message total_down total_up other_down other_up effective_down effective_up other_count wan_if verified
+	local enabled state message total_down total_up other_down other_up degraded effective_down effective_up other_count wan_if verified
 	config_load bwlimit
 	config_get_bool enabled main enabled 0
 	config_get total_down main total_down_kbit '8800'
 	config_get total_up main total_up_kbit '4200'
-	config_get other_down main other_min_down_kbit '500'
-	config_get other_up main other_min_up_kbit '128'
+	config_get other_down main other_down_kbit '768'
+	config_get other_up main other_up_kbit '128'
+	config_get degraded main other_degraded_kbit '64'
 	state="$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)"
 	message="$(cat "$SHAPER_STATE_DIR/message" 2>/dev/null)"
 	wan_if="$(cat "$SHAPER_STATE_DIR/wan_if" 2>/dev/null)"
@@ -429,8 +531,9 @@ method_shaper() {
 	json_add_string wan_if "$wan_if"
 	json_add_string total_down_kbit "$total_down"
 	json_add_string total_up_kbit "$total_up"
-	json_add_string other_min_down_kbit "$other_down"
-	json_add_string other_min_up_kbit "$other_up"
+	json_add_string other_down_kbit "$other_down"
+	json_add_string other_up_kbit "$other_up"
+	json_add_string other_degraded_kbit "$degraded"
 	json_add_string effective_other_down_kbit "${effective_down:-$other_down}"
 	json_add_string effective_other_up_kbit "${effective_up:-$other_up}"
 	json_add_string other_count "${other_count:-0}"
@@ -467,11 +570,11 @@ method_set_quota() {
 		return 1
 	fi
 	requested="$(uint_mul "$requested" 1000000)"
-	old="$(uci -q get bwlimit.main.quota_bytes)"
-	is_uint "$old" || old='2000000000'
-	if ! uci -q set bwlimit.main.quota_bytes="$requested" ||
+	old="$(uci -q get bwlimit.main.quota_per_device_bytes)"
+	is_uint "$old" || old='700000000'
+	if ! uci -q set bwlimit.main.quota_per_device_bytes="$requested" ||
 		! uci -q commit bwlimit ||
-		[ "$(uci -q get bwlimit.main.quota_bytes)" != "$requested" ]; then
+		[ "$(uci -q get bwlimit.main.quota_per_device_bytes)" != "$requested" ]; then
 		if restore_quota_value "$old"; then
 			json_error 'No se pudo guardar la cuota; se verificó la restauración del valor anterior.'
 		else
@@ -479,7 +582,7 @@ method_set_quota() {
 		fi
 		return 1
 	fi
-	/etc/init.d/nano-accounting restart >/dev/null 2>&1
+	"$RECONCILE" reconcile >/dev/null 2>&1
 	rc=$?
 	if [ "$rc" -ne 0 ] || ! wait_accounting_quota "$requested"; then
 		if restore_quota_value "$old"; then

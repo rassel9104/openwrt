@@ -2,15 +2,52 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 RaykTo <raktodev@gmail.com>
 
-# Las configuraciones son conffiles: sólo se añaden claves ausentes para migrar a v3.
+# Las configuraciones son conffiles: la migración v4 sustituye la cuota grupal
+# por cuota y techo estrictos por cada dispositivo de Otros.
+is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+write_v4_migration() {
+	local state='/etc/nano-monitor/daily-state' marker='/etc/nano-monitor/v4-migration' day up down used quota='700000000'
+	day="$(sed -n 's/^day=//p' "$state" 2>/dev/null | sed -n '1p')"
+	up="$(sed -n 's/^others_up=//p' "$state" 2>/dev/null | sed -n '1p')"
+	down="$(sed -n 's/^others_down=//p' "$state" 2>/dev/null | sed -n '1p')"
+	if is_uint "$up" && is_uint "$down"; then
+		used="$(awk -v a="$up" -v b="$down" -v q="$quota" 'BEGIN { n=a+b; if (n>q) n=q; printf "%.0f", n }')"
+	else
+		# Sin estado fiable no se concede una cuota nueva a mitad del día.
+		day="$(date +%F)"; used="$quota"
+	fi
+	case "$day" in ????-??-??) ;; *) day="$(date +%F)"; used="$quota" ;; esac
+	mkdir -p -m 0700 /etc/nano-monitor || return 1
+	umask 077
+	{
+		printf 'day=%s\n' "$day"
+		printf 'used=%s\n' "$used"
+	} > "$marker.tmp" && mv "$marker.tmp" "$marker"
+}
+
+legacy_bwlimit_script_owned() {
+	[ -f /etc/init.d/bwlimit ] || return 1
+	{ grep -Fq 'TABLE_NAME="bwlimit"' /etc/init.d/bwlimit || grep -Fq "TABLE_NAME='bwlimit'" /etc/init.d/bwlimit; } && grep -Fq 'bwlimit-drop' /etc/init.d/bwlimit
+}
+
+legacy_bwlimit_table_owned() {
+	local rules lan subnet
+	lan="$(uci -q get bwlimit.main.lan_if)"; subnet="$(uci -q get bwlimit.main.subnet)"
+	[ -n "$lan" ] || lan='br-lan'; [ -n "$subnet" ] || subnet='192.168.1.0/24'
+	rules="$(nft list table inet bwlimit 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" | grep -Fq 'chain forward {' || return 1
+	printf '%s\n' "$rules" | grep -F "iifname \"$lan\" ip saddr $subnet" | grep -Fq 'limit rate over' || return 1
+	printf '%s\n' "$rules" | grep -F "oifname \"$lan\" ip daddr $subnet" | grep -Fq 'limit rate over'
+}
+
 migrated_from_legacy=0
+needs_v4_migration=0
 if uci -q get bwlimit.main >/dev/null; then
 	previous_schema="$(uci -q get bwlimit.main.schema_version)"
-	uci -q set bwlimit.main.schema_version='3'
 	[ -n "$(uci -q get bwlimit.main.wan_network)" ] || uci -q set bwlimit.main.wan_network='provider'
-	if [ "$previous_schema" != '3' ]; then
+	if [ "$previous_schema" != '3' ] && [ "$previous_schema" != '4' ]; then
 		migrated_from_legacy=1
-		uci -q set bwlimit.main.enabled='0'
 		uci -q set bwlimit.main.total_down_kbit='8800'
 		uci -q set bwlimit.main.total_up_kbit='4200'
 		uci -q delete bwlimit.main.exempt_ip
@@ -20,16 +57,33 @@ if uci -q get bwlimit.main >/dev/null; then
 		[ -n "$(uci -q get bwlimit.main.total_down_kbit)" ] || uci -q set bwlimit.main.total_down_kbit='8800'
 		[ -n "$(uci -q get bwlimit.main.total_up_kbit)" ] || uci -q set bwlimit.main.total_up_kbit='4200'
 	fi
-	[ -n "$(uci -q get bwlimit.main.enabled)" ] || uci -q set bwlimit.main.enabled='0'
-	[ -n "$(uci -q get bwlimit.main.other_min_down_kbit)" ] || uci -q set bwlimit.main.other_min_down_kbit='500'
-	[ -n "$(uci -q get bwlimit.main.other_min_up_kbit)" ] || uci -q set bwlimit.main.other_min_up_kbit='128'
-	[ -n "$(uci -q get bwlimit.main.quota_enabled)" ] || uci -q set bwlimit.main.quota_enabled='1'
-	[ -n "$(uci -q get bwlimit.main.quota_bytes)" ] || uci -q set bwlimit.main.quota_bytes='2000000000'
+	if [ "$previous_schema" != '4' ]; then
+		needs_v4_migration=1
+		uci -q set bwlimit.main.other_down_kbit='768'
+		uci -q set bwlimit.main.other_up_kbit='128'
+		uci -q set bwlimit.main.other_degraded_kbit='64'
+		uci -q set bwlimit.main.quota_per_device_bytes='700000000'
+		uci -q delete bwlimit.main.other_min_down_kbit
+		uci -q delete bwlimit.main.other_min_up_kbit
+		uci -q delete bwlimit.main.quota_bytes
+	fi
+	[ -n "$(uci -q get bwlimit.main.enabled)" ] || uci -q set bwlimit.main.enabled='1'
+	[ -n "$(uci -q get bwlimit.main.other_down_kbit)" ] || uci -q set bwlimit.main.other_down_kbit='768'
+	[ -n "$(uci -q get bwlimit.main.other_up_kbit)" ] || uci -q set bwlimit.main.other_up_kbit='128'
+	[ -n "$(uci -q get bwlimit.main.other_degraded_kbit)" ] || uci -q set bwlimit.main.other_degraded_kbit='64'
+	# La cuota individual es parte obligatoria del contrato 1.4.0; no se publica
+	# un interruptor que el runtime ignore.
+	uci -q set bwlimit.main.quota_enabled='1'
+	[ -n "$(uci -q get bwlimit.main.quota_per_device_bytes)" ] || uci -q set bwlimit.main.quota_per_device_bytes='700000000'
 	[ -n "$(uci -q get bwlimit.main.quota_reset_hour)" ] || uci -q set bwlimit.main.quota_reset_hour='0'
 	[ -n "$(uci -q get bwlimit.main.quota_reset_minute)" ] || uci -q set bwlimit.main.quota_reset_minute='1'
 	[ -n "$(uci -q get bwlimit.main.quota_persist_interval)" ] || uci -q set bwlimit.main.quota_persist_interval='1800'
 	[ -n "$(uci -q get bwlimit.main.quota_persist_step_bytes)" ] || uci -q set bwlimit.main.quota_persist_step_bytes='64000000'
-	uci -q commit bwlimit
+	# El seed durable se confirma antes de avanzar schema_version. Si el commit
+	# falla, el reintento vuelve a escribir el mismo seed y completa la transición.
+	[ "$needs_v4_migration" = '0' ] || write_v4_migration || exit 1
+	uci -q set bwlimit.main.schema_version='4' || exit 1
+	uci -q commit bwlimit || { uci -q revert bwlimit.main.schema_version; exit 1; }
 fi
 
 # La contabilidad diaria se calcula explícitamente en la zona del propietario.
@@ -45,17 +99,22 @@ uci -q commit firewall
 /etc/init.d/firewall restart >/dev/null 2>&1
 
 /etc/init.d/nano-accounting enable >/dev/null 2>&1
-# La versión anterior instalaba este limitador. Debe quedar retirado incluso
-# cuando el nuevo shaping se mantenga desactivado para una puesta en marcha segura.
-/etc/init.d/bwlimit disable >/dev/null 2>&1
-/etc/init.d/bwlimit stop >/dev/null 2>&1
-nft delete table inet bwlimit >/dev/null 2>&1
-nft list table inet bwlimit >/dev/null 2>&1 && exit 1
-rm -f /etc/rc.d/S??bwlimit /etc/rc.d/K??bwlimit
-if [ "$migrated_from_legacy" = '1' ] && [ -x /etc/init.d/nlbwmon ]; then
-	/etc/init.d/nlbwmon stop >/dev/null 2>&1
-	/etc/init.d/nlbwmon disable >/dev/null 2>&1
+# La versión anterior instalaba este limitador. Sólo se retiran el servicio y
+# la tabla cuando conservan su firma exacta; nlbwmon puede ser uso del dueño y
+# no interfiere con los contadores propios.
+legacy_bwlimit_owned=0
+if legacy_bwlimit_script_owned; then
+	legacy_bwlimit_owned=1
+	/etc/init.d/bwlimit stop >/dev/null 2>&1
+	/etc/init.d/bwlimit disable >/dev/null 2>&1
 fi
+if nft list table inet bwlimit >/dev/null 2>&1; then
+	legacy_bwlimit_table_owned || exit 1
+	legacy_bwlimit_owned=1
+	nft delete table inet bwlimit >/dev/null 2>&1 || exit 1
+	nft list table inet bwlimit >/dev/null 2>&1 && exit 1
+fi
+[ "$legacy_bwlimit_owned" = '0' ] || rm -f /etc/rc.d/S??bwlimit /etc/rc.d/K??bwlimit
 if [ "$(uci -q get bwlimit.main.enabled)" = '1' ]; then
 	/etc/init.d/nano-shaper enable >/dev/null 2>&1
 else
