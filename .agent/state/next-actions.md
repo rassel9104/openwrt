@@ -3,16 +3,20 @@
 > Max 2 KB. Preserve only current direction, not history.
 
 ## Now
-- [x] Nano Monitor 1.4.0-r18 compilado, revisado, instalado y publicado en `ff12ddc212f`.
+- [x] Nano Monitor 1.4.0-r21 compilado e instalado; fingerprint tc live estable y RPC shaper `verified/applied`.
 - [x] Recuperación exacta no acumulativa, bonus diario y velocidad reversible por dispositivo implementados con readback LuCI.
-- [x] Hold histórico activo y verificado: tres equipos en cero, sin reatribución, a 64 Kbit/s hasta el reset válido.
-- [x] Radio, uplink, prioritarios, flow offloading y qdisc preservados; gate de despliegue retirada.
+- [x] Hold liberado para los tres IDs exactos: marker ausente, `migration_hold=0`, 700000000 por equipo, bonus cero y sin degradación.
+- [x] Tras colisión con el reset de 00:01, contabilidad y shaper reconciliados; gates ausentes y router con conectividad exterior.
+- [x] El owner confirmó que Internet volvió en su PC.
+- [x] El owner confirmó visualmente r21: LuCI muestra el readback efectivo y ya no convierte una lectura RPC fallida en ceros engañosos.
+- [x] Retirado un proceso huérfano de reconciliación por identidad exacta; queda un solo daemon de contabilidad y RPC volvió a `verified=1`.
 
 ## Next
-- [ ] Tras el siguiente reset real de las 00:01 `America/New_York`, verificar marker ausente, checkpoints `exact-v1`, usos desde cero y perfil normal 768/128.
-- [ ] Obtener aceptación visual explícita de los nuevos controles individuales.
+- [x] Completar comprobación de checkpoints y preservaciones restantes.
+- [x] Commit funcional `88dfaaca62e5f0a9d340c5813b0625bfe501a187` publicado y verificado en `fork/nano-m5-upper-5ghz`.
+- [x] Cierre operativo actualizado; no queda acción pendiente.
 
 ## Waiting / parked
 - [x] Presentación base de r14 confirmada visualmente por el owner.
 - [x] El owner confirmó que r14 resolvió el rendimiento.
-- [ ] No forzar reset ni consumo productivo; esperar el evento diario real para la validación de transición.
+- [x] La instrucción de esperar el reset fue sustituida por autorización explícita del owner para liberación anticipada, exacta y asistida.
