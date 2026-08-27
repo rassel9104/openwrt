@@ -25,24 +25,20 @@ last_updated: 2026-08-27
 - Preservar `.agent/state/agent-routing.json`; no hay bridge activo.
 
 ## Current validated state
-- `luci-app-nano-monitor_1.4.0-r21` está instalado en `Raul-M5`; IPK SHA-256 `c557217d52546c79729ade2a0e4f281146432b4682063b2bd9089937bc29d4c9` (48.0 KiB), con paridad source/payload minificado.
-- r19 reveló live un fingerprint tc inestable por contadores, pseudo-clases fq_codel y `leaf`; r20 canonicaliza sólo esos valores runtime, conserva la topología real y obtuvo revisión independiente `PASS`.
-- r21 corrige la regresión visual observada: una respuesta RPC ausente ya muestra `Lectura no disponible` y guiones, no `Requiere atención` con velocidades y equipos falsamente en cero. El asset corregido está instalado, servido por HTTP y confirmado visualmente por el owner con los valores efectivos.
-- La liberación coincidió con el reset de las 00:01 y dejó temporalmente el tráfico reenviado congelado y la transición incompleta. Tras reconciliar contabilidad y reiniciar shaper, no queda gate, marker ni hold.
-- RPC accounting está `active/verified`, día `2026-08-27`, `migration_hold=0`, tres IDs exactos con límite 700000000, bonus cero y sin degradación; el consumo live posterior ya puede ser mayor que cero.
-- RPC shaper está `active/verified/applied` con readback live estable, `.58/.59` por bypass directo y Otros bajo HTB. El router alcanzó `1.1.1.1` con 3/3 respuestas.
-- El owner confirmó que Internet volvió en su PC. La instalación r21 preservó los dos conffiles activos; los defaults `-opkg` se eliminaron sólo tras verificar sus hashes exactos.
-- Un proceso huérfano iniciado anteriormente como `accounting-daemon reconcile` (el daemon no tiene modo one-shot) competía con el servicio y causó un readback `verified=0`. Se retiró por PID y cmdline exactos sin ejecutar su cleanup compartido; queda un solo daemon y RPC accounting volvió a `active/verified`.
-- Uplink `provider`→`pppoe-provider`, radio 167/HT20 y flow offloading desactivado permanecen preservados.
-- Pasaron sintaxis shell/JavaScript, `git diff --check`, build OpenWrt, pruebas enfocadas, readback live y revisión independiente.
-- Rollback r16 y backups live permanecen fuera de Git; `recovery-kit/` continúa local y excluido.
-- Commit funcional de cierre `88dfaaca62e5f0a9d340c5813b0625bfe501a187` publicado y verificado en `fork/nano-m5-upper-5ghz`; `Makefile` y `AUTHORS` identifican explícitamente a RaykTo como owner/maintainer.
+- `luci-app-nano-monitor_1.4.0-r23` está instalado en `Raul-M5`; IPK SHA-256 `a66dd15ddb47147d91fce5cebbc534af8780cc5056bb092a5a10660bf804dbb0`, arquitectura `mips_24kc` y autoría RaykTo verificadas.
+- r23 corrige la incidencia individual con hasta dos reconciliaciones completas, esperas acotadas de 15 comprobaciones y rollback por los mismos helpers verificados; LuCI acepta bonus en pasos de 1 MB.
+- Una prueba r22 bajo lock ejercitó el segundo ciclo y convergió en 29 s. La limpieza posterior reveló además que el hotplug podía detener accounting al vencer su espera interna de 10 s; r23 la amplía a 15 s y fue revisado independientemente con `PASS`.
+- Bajo r23, Yady completó 50→0→50 MB por RPC real en 21/23 s. Estado final: `bonus_bytes=50000000`, `limit_bytes=750000000`, accounting `active/verified`, shaper `verified/applied`, un solo daemon y sin pending ni gates.
+- Los conffiles activos conservaron sus hashes exactos; IPK temporal, respaldos RAM y defaults `-opkg` se retiraron sólo tras verificarlos. Quedan 168 KiB libres en overlay.
+- El asset LuCI servido por HTTP coincide con el payload r23. Uplink `provider`→`pppoe-provider`, radio 167/HT20, flow offloading 0/0 y conectividad exterior 3/3 permanecen preservados.
+- Pasaron sintaxis shell/JavaScript, `git diff --check`, build OpenWrt, pruebas enfocadas, readback live y revisión independiente. `recovery-kit/` continúa local y excluido.
+- El owner confirmó visualmente Yady con 50 MB extra en LuCI. El commit funcional r23 `2e14f3fcb31987f493f8321daedcb1e10a356440` está publicado y verificado en `fork/nano-m5-upper-5ghz`.
 
 ## Open decision / acceptance boundary
-- Cerrada: recuperación técnica, conectividad del PC, presentación r21 y publicación remota confirmadas.
+- Cerrada: capacidad individual validada técnicamente y aceptada visualmente por el owner bajo r23.
 
 ## Next safe action
-- Ninguna acción de cierre pendiente; mantener operación normal y observar sólo ante una incidencia nueva.
+- Ninguna acción pendiente; mantener operación normal y observar sólo ante una incidencia nueva.
 
 ## Active references
 - `package/luci-app-nano-monitor/`
