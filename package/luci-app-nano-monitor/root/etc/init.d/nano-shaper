@@ -82,7 +82,7 @@ collect_reservation() {
 }
 
 load_settings() {
-	local status value tab id mac ip name reserved period_day registry tmp="$DEVICES_FILE.tmp"
+	local status value tab id mac ip name period_day registry tmp="$DEVICES_FILE.tmp"
 	config_load bwlimit
 	config_get_bool enabled main enabled 0
 	config_get lan_if main lan_if 'br-lan'
@@ -134,12 +134,10 @@ load_settings() {
 $registry
 EOF
 	mv "$tmp" "$DEVICES_FILE" || return 1
-	# HTB "rate" reserves bandwidth even when a class is idle. Reserve only a
-	# token 1 Kbit/s per leaf; the configured values are strict ceilings.
-	reserved=$((BASE_RATE_KBIT * (other_count * 2 + 2)))
-	priority_down_kbit=$((total_down_kbit - reserved))
-	priority_up_kbit=$((total_up_kbit - reserved))
-	[ "$priority_down_kbit" -ge 64 ] && [ "$priority_up_kbit" -ge 64 ] || return 1
+	# Kept only in the ownership manifest so releases that predate the direct
+	# priority path remain safely removable. Priority traffic has no HTB class.
+	priority_down_kbit=0
+	priority_up_kbit=0
 }
 
 ensure_offloading_disabled() {
@@ -246,12 +244,13 @@ table $TABLE_FAMILY $TABLE_NAME {
 	set priority_v4 { type ipv4_addr; elements = { $PRIORITY_SET }; }
 	chain classify {
 		type filter hook forward priority mangle; policy accept;
-		iifname "$lan_if" oifname "$wan_if" ip saddr @priority_v4 counter meta priority set $WAN_HANDLE:10 return
-		iifname "$wan_if" oifname "$lan_if" ip daddr @priority_v4 counter meta priority set $LAN_HANDLE:10 return
+		iifname "$lan_if" oifname "$wan_if" ip saddr @priority_v4 counter meta priority set $WAN_HANDLE:0 return
+		iifname "$wan_if" oifname "$lan_if" ip daddr @priority_v4 counter meta priority set $LAN_HANDLE:0 return
 	}
 	chain local_output {
 		type filter hook output priority mangle; policy accept;
-		oifname "$lan_if" counter meta priority set $LAN_HANDLE:10 return
+		oifname "$wan_if" counter meta priority set $WAN_HANDLE:0 return
+		oifname "$lan_if" counter meta priority set $LAN_HANDLE:0 return
 	}
 }
 EOF
@@ -267,6 +266,9 @@ install_tree_skeleton() {
 		''|*'qdisc noqueue 0:'*) ;;
 		*) [ "$root" = "$DEFAULT_WAN_QDISC" ] || return 1 ;;
 	esac
+	# :0 is HTB's direct queue. The nft classifier sends only priority and
+	# router-originated traffic there; every unclassified client remains on the
+	# fail-safe :20 class.
 	tc qdisc replace dev "$dev" root handle "$handle:" htb default 20 || return 1
 	[ "$handle" = "$WAN_HANDLE" ] && created_wan=1 || created_lan=1
 	tc class add dev "$dev" parent "$handle:" classid "$handle:1" htb rate "${total}kbit" ceil "${total}kbit" || return 1
@@ -283,13 +285,11 @@ verify_tree_skeleton() {
 }
 
 populate_tree() {
-	local dev="$1" handle="$2" total="$3" priority="$4" direction="$5" forced="$6"
+	local dev="$1" handle="$2" direction="$3" forced="$4"
 	local tab id mac ip down up normal classid=101 slowid
 	# Active-tree readback requires this sentinel in addition to the reserved
 	# root handle.
 	tc class add dev "$dev" parent "$handle:1" classid "$handle:$OWNER_CLASS" htb rate "${BASE_RATE_KBIT}kbit" ceil "${BASE_RATE_KBIT}kbit" prio 7 quantum 1514 || return 1
-	tc class add dev "$dev" parent "$handle:1" classid "$handle:10" htb rate "${priority}kbit" ceil "${total}kbit" prio 0 quantum 1514 || return 1
-	tc qdisc add dev "$dev" parent "$handle:10" handle 10: fq_codel limit 256 target 5ms interval 100ms quantum 1514 ecn || return 1
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip down up; do
 		[ -z "$id" ] && continue
@@ -311,13 +311,14 @@ class_value_matches() {
 }
 
 verify_tree() {
-	local dev="$1" handle="$2" total="$3" priority="$4" direction="$5" forced="$6"
+	local dev="$1" handle="$2" total="$3" direction="$4" forced="$5"
 	local tab id mac ip down up normal classid=101 slowid
 	tc qdisc show dev "$dev" | grep -q "qdisc htb $handle: root" || return 1
 	class_value_matches "$dev" "$handle:1" ceil $((total * 125)) || return 1
 	class_value_matches "$dev" "$handle:$OWNER_CLASS" rate $((BASE_RATE_KBIT * 125)) || return 1
-	class_value_matches "$dev" "$handle:10" rate $((priority * 125)) || return 1
 	class_value_matches "$dev" "$handle:20" ceil $((degraded_kbit * 125)) || return 1
+	! tc class show dev "$dev" 2>/dev/null | grep -q "^class htb $handle:10 " || return 1
+	! tc qdisc show dev "$dev" 2>/dev/null | grep -q "^qdisc fq_codel 10: parent $handle:10 " || return 1
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip down up; do
 		[ -z "$id" ] && continue
@@ -341,7 +342,8 @@ local_output_classifier_ok() {
 	local rules
 	rules="$(nft list chain "$TABLE_FAMILY" "$TABLE_NAME" local_output 2>/dev/null)" || return 1
 	printf '%s\n' "$rules" | grep -Fq 'type filter hook output priority mangle; policy accept;' || return 1
-	printf '%s\n' "$rules" | grep -F "oifname \"$lan_if\"" | grep -Fq "meta priority set $LAN_HANDLE:10 return"
+	printf '%s\n' "$rules" | grep -F "oifname \"$wan_if\"" | grep -Fq "meta priority set $WAN_HANDLE:0 return" || return 1
+	printf '%s\n' "$rules" | grep -F "oifname \"$lan_if\"" | grep -Fq "meta priority set $LAN_HANDLE:0 return"
 }
 
 legacy_classifier_owned() {
@@ -392,8 +394,15 @@ save_manifest() {
 }
 
 write_applied_snapshot() {
-	local scope="${1:-last_apply}" tmp="$STATE_DIR/applied-snapshot.tmp" ip tab id mac down up
+	local scope="${1:-last_apply}" tmp="$STATE_DIR/applied-snapshot.tmp" ip tab id mac down up nft_sha256 wan_tc_sha256 lan_tc_sha256 value
 	case "$scope" in last_apply|safe_fallback) ;; *) return 1 ;; esac
+	nft_sha256="$(shaper_nft_topology_fingerprint)" || return 1
+	wan_tc_sha256="$(tc_topology_fingerprint "$wan_if")" || return 1
+	lan_tc_sha256="$(tc_topology_fingerprint "$lan_if")" || return 1
+	for value in "$nft_sha256" "$wan_tc_sha256" "$lan_tc_sha256"; do
+		[ "${#value}" = '64' ] || return 1
+		case "$value" in *[!0-9a-f]*) return 1 ;; esac
+	done
 	{
 		printf 'applied_at=%s\n' "$(date +%s)"
 		printf 'verification_scope=%s\n' "$scope"
@@ -404,6 +413,9 @@ write_applied_snapshot() {
 		printf 'other_up_kbit=%s\n' "$other_up_kbit"
 		printf 'degraded_kbit=%s\n' "$degraded_kbit"
 		printf 'other_count=%s\n' "$other_count"
+		printf 'nft_topology_sha256=%s\n' "$nft_sha256"
+		printf 'wan_tc_topology_sha256=%s\n' "$wan_tc_sha256"
+		printf 'lan_tc_topology_sha256=%s\n' "$lan_tc_sha256"
 		for ip in $PRIORITY_IPS; do printf 'priority_ip=%s\n' "$ip"; done
 		tab="$(printf '\t')"
 		while IFS="$tab" read -r id mac ip down up; do
@@ -411,6 +423,32 @@ write_applied_snapshot() {
 			[ -z "$id" ] || printf 'device\t%s\t%s\t%s\t%s\n' "$id" "$ip" "$down" "$up"
 		done < "$DEVICES_FILE"
 	} > "$tmp" && mv "$tmp" "$STATE_DIR/applied-snapshot"
+}
+
+shaper_nft_topology_fingerprint() {
+	local rules
+	rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" |
+		awk '{ gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>"); print }' |
+		sha256sum | awk '{ print $1 }'
+}
+
+tc_topology_fingerprint() {
+	local dev="$1" qdisc classes
+	valid_iface "$dev" || return 1
+	qdisc="$(tc qdisc show dev "$dev" 2>/dev/null)" || return 1
+	classes="$(tc class show dev "$dev" 2>/dev/null)" || return 1
+	# tc exposes packet counters in the root qdisc and unstable kernel leaf
+	# identifiers in class text.  Keep every qdisc plus the real HTB classes,
+	# but canonicalize those runtime-only values before hashing the topology.
+	qdisc="$(printf '%s\n' "$qdisc" |
+		awk '{ gsub(/direct_packets_stat [0-9]+/, "direct_packets_stat <runtime>"); print }' |
+		sort)" || return 1
+	classes="$(printf '%s\n' "$classes" |
+		awk '/^class htb / { gsub(/ leaf [^ ]+/, " leaf <qdisc>"); print }' |
+		sort)" || return 1
+	[ -n "$qdisc" ] && [ -n "$classes" ] || return 1
+	printf 'qdisc=%s\nclasses=%s\n' "$qdisc" "$classes" | sha256sum | awk '{ print $1 }'
 }
 
 load_manifest() {
@@ -536,21 +574,23 @@ activate_safe_fallback() {
 	# the tree that is actually left enforcing traffic.
 	other_down_kbit="$degraded_kbit"; other_up_kbit="$degraded_kbit"
 	save_manifest || { other_down_kbit="$configured_down"; other_up_kbit="$configured_up"; return 1; }
+	# Publish the direct priority path before either HTB root appears. The gate
+	# continues blocking Otros until the complete fallback passes readback.
+	install_classifier || return 1
+	created_classifier=1
 	install_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" || return 1
 	install_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || return 1
 	verify_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" && verify_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || return 1
-	populate_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up "$degraded_kbit" || return 1
-	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down "$degraded_kbit" || return 1
-	install_classifier || return 1
-	created_classifier=1
-	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up "$degraded_kbit" &&
-		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down "$degraded_kbit" &&
+	populate_tree "$wan_if" "$WAN_HANDLE" up "$degraded_kbit" || return 1
+	populate_tree "$lan_if" "$LAN_HANDLE" down "$degraded_kbit" || return 1
+	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" up "$degraded_kbit" &&
+		verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" down "$degraded_kbit" &&
 		local_output_classifier_ok || return 1
 	[ "$require_accounting" != '1' ] || accounting_classifier_ok || return 1
 	write_applied_snapshot safe_fallback || return 1
 	remove_gate || return 1
 	printf '%s\n' active > "$STATE_DIR/owned"
-	write_state safe "$reason Se verificó el perfil preventivo de 64 Kbit/s para Otros." || return 1
+	write_state safe "$reason Se verificó el perfil preventivo de 64 Kbit/s sólo para Otros y el bypass prioritario." || return 1
 	[ "$require_accounting" != '0' ] || schedule_boot_promotion
 	return 0
 }
@@ -618,18 +658,20 @@ start_service() {
 	root_qdisc_free "$wan_if" && root_qdisc_free "$lan_if" || { fail_after_clear 'Apareció un qdisc ajeno tras retirar el árbol anterior; no se reemplazó.'; return 1; }
 	! nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1 || { fail_after_clear 'Apareció una tabla nft ajena tras retirar el clasificador anterior; no se reemplazó.'; return 1; }
 	save_manifest || { fail_after_clear 'No se pudo guardar el manifiesto de propiedad.'; return 1; }
+	# Install direct classification first so priority and router-originated
+	# packets never enter the default limited class while the roots are built.
+	install_classifier || { fail_after_clear 'Falló el bypass prioritario.'; return 1; }
+	created_classifier=1
 	install_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" || { fail_after_clear 'Falló el esqueleto HTB seguro de subida.'; return 1; }
 	install_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || { fail_after_clear 'Falló el esqueleto HTB seguro de descarga.'; return 1; }
 	verify_tree_skeleton "$wan_if" "$WAN_HANDLE" "$total_up_kbit" && verify_tree_skeleton "$lan_if" "$LAN_HANDLE" "$total_down_kbit" || { fail_after_clear 'Falló el readback de los esqueletos preventivos.'; return 1; }
-	populate_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up '' || { fail_after_clear 'Falló el árbol HTB de subida.'; return 1; }
-	populate_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down '' || { fail_after_clear 'Falló el árbol HTB de descarga.'; return 1; }
-	install_classifier || { fail_after_clear 'Falló el clasificador prioritario.'; return 1; }
-	created_classifier=1
-	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" "$priority_up_kbit" up '' && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" "$priority_down_kbit" down '' && accounting_classifier_ok && local_output_classifier_ok || { fail_after_clear 'Falló el readback del límite individual o del acceso local al router.'; return 1; }
+	populate_tree "$wan_if" "$WAN_HANDLE" up '' || { fail_after_clear 'Falló el árbol HTB de subida.'; return 1; }
+	populate_tree "$lan_if" "$LAN_HANDLE" down '' || { fail_after_clear 'Falló el árbol HTB de descarga.'; return 1; }
+	verify_tree "$wan_if" "$WAN_HANDLE" "$total_up_kbit" up '' && verify_tree "$lan_if" "$LAN_HANDLE" "$total_down_kbit" down '' && accounting_classifier_ok && local_output_classifier_ok || { fail_after_clear 'Falló el readback del límite individual o del bypass prioritario.'; return 1; }
 	remove_gate || { write_failure_state 'El shaping quedó instalado, pero la protección transitoria no pudo retirarse.'; return 1; }
 	write_applied_snapshot last_apply || { write_failure_state 'El shaping quedó instalado, pero no se pudo publicar su manifiesto aplicado.'; return 1; }
 	printf '%s\n' active > "$STATE_DIR/owned"
-	write_state active 'Topes individuales y degradación a 64 Kbit/s verificados.' || return 1
+	write_state active 'Topes individuales sólo para Otros y bypass prioritario sin techo verificados.' || return 1
 }
 
 stop_service() {

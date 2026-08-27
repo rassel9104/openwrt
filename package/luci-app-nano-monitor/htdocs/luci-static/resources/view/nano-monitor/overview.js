@@ -237,7 +237,7 @@ function applyDevicePolicy(device, response, reset, button) {
 		return Promise.resolve();
 	}
 	if (!Number.isInteger(down) || down < degraded || down > maxDown || !Number.isInteger(up) || up < degraded || up > maxUp) {
-		ui.addNotification(null, E('p', {}, 'La velocidad debe respetar los límites mostrados del enlace.'), 'error');
+		ui.addNotification(null, E('p', {}, 'La velocidad debe respetar el máximo configurable para Otros.'), 'error');
 		return Promise.resolve();
 	}
 	if (button)
@@ -259,15 +259,31 @@ function applyDevicePolicy(device, response, reset, button) {
 }
 
 function renderShaper(response) {
+	var requiredRates = [ 'total_down_kbit', 'total_up_kbit', 'effective_other_down_kbit', 'effective_other_up_kbit', 'other_degraded_kbit', 'other_count' ];
+	var valid = response && (response.enabled === '0' || response.enabled === '1') && requiredRates.every(function(field) {
+		var value = Number(response[field]);
+		return Number.isFinite(value) && value >= 0;
+	});
+	if (!valid) {
+		setText('nm-shaper-state', 'Lectura no disponible');
+		setText('nm-shaper-message', 'LuCI no recibió el estado del servicio; volverá a consultarlo automáticamente.');
+		setText('nm-shaper-total', '—');
+		setText('nm-shaper-ordinary', '—');
+		setText('nm-shaper-degraded', '—');
+		setText('nm-shaper-priority', '—');
+		setText('nm-shaper-count', '—');
+		return;
+	}
 	var active = response.applied === '1';
 	var safeFallback = active && response.verification_scope === 'safe_fallback';
+	var liveReadback = active && response.verification_scope === 'live_readback';
 	var priority = Array.isArray(response.priority_ips) ? response.priority_ips : [];
-	setText('nm-shaper-state', safeFallback ? 'Perfil preventivo verificado' : (active ? 'Última aplicación verificada' : (response.enabled === '1' ? 'Requiere atención' : 'Desactivado')));
+	setText('nm-shaper-state', safeFallback ? 'Perfil preventivo verificado' : (liveReadback ? 'Aplicación verificada en vivo' : (active ? 'Aplicación verificada' : (response.enabled === '1' ? 'Requiere atención' : 'Desactivado'))));
 	setText('nm-shaper-message', response.message || 'Esperando readback del servicio.');
 	setText('nm-shaper-total', formatRate(Number(response.total_down_kbit) * 1000) + ' ↓ · ' + formatRate(Number(response.total_up_kbit) * 1000) + ' ↑');
 	setText('nm-shaper-ordinary', formatRate(Number(response.effective_other_down_kbit) * 1000) + ' ↓ · ' + formatRate(Number(response.effective_other_up_kbit) * 1000) + ' ↑');
 	setText('nm-shaper-degraded', 'Al agotar su cuota: ' + formatRate(Number(response.other_degraded_kbit) * 1000));
-	setText('nm-shaper-priority', priority.length + ' equipos · sin techo individual');
+	setText('nm-shaper-priority', priority.length + ' equipos · fuera del shaping');
 	setText('nm-shaper-count', String(response.other_count || 0) + ' equipos conocidos');
 }
 
@@ -390,11 +406,11 @@ return view.extend({
 				E('h2', { 'id': 'nm-shaper-title' }, 'Prioridad de red'),
 				E('div', { 'class': 'nm-grid' }, [
 					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Estado efectivo'), E('div', { 'id': 'nm-shaper-state', 'class': 'nm-value nm-state' }, '—'), E('small', { 'id': 'nm-shaper-message' }, '') ]),
-					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Techo administrado'), E('div', { 'id': 'nm-shaper-total', 'class': 'nm-value' }, '—') ]),
-					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Techo por cada Otro'), E('div', { 'id': 'nm-shaper-ordinary', 'class': 'nm-value' }, '—'), E('small', { 'id': 'nm-shaper-degraded' }, '—') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Máximo configurable por Otro'), E('div', { 'id': 'nm-shaper-total', 'class': 'nm-value' }, '—') ]),
+					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Valor general por cada Otro'), E('div', { 'id': 'nm-shaper-ordinary', 'class': 'nm-value' }, '—'), E('small', { 'id': 'nm-shaper-degraded' }, '—') ]),
 					E('div', { 'class': 'nm-card' }, [ E('small', {}, 'Equipos prioritarios'), E('div', { 'id': 'nm-shaper-priority', 'class': 'nm-value' }, '—'), E('small', { 'id': 'nm-shaper-count' }, '—') ])
 				]),
-				E('p', { 'class': 'nm-note' }, 'PC y teléfono prioritarios pueden usar el techo disponible sin límite individual. Otros parte de 768/128 Kbit/s salvo ajuste individual; al agotar su disponibilidad diaria continúa conectado a 64 Kbit/s.')
+				E('p', { 'class': 'nm-note' }, 'PC y teléfono prioritarios no pasan por los topes de Nano Monitor; su velocidad depende sólo de la red y del proveedor. Otros parte de 768/128 Kbit/s salvo ajuste individual; al agotar su disponibilidad diaria continúa conectado a 64 Kbit/s.')
 			])
 		]);
 

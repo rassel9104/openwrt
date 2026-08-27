@@ -7,6 +7,11 @@
 
 TABLE_FAMILY='inet'
 TABLE_NAME='nano_accounting'
+RELEASE_GATE_TABLE='nano_release_gate'
+RELEASE_GATE_OWNER='nano-monitor-release-v1'
+RESET_GATE_TABLE='nano_accounting_reset_gate'
+RESET_GATE_OWNER='nano-monitor-reset-v1'
+TRANSITION_LOCK='/var/run/nano-accounting-transition.lock'
 RUN_DIR='/var/run/nano-accounting'
 STATE_DIR='/etc/nano-monitor'
 STATE_FILE="$STATE_DIR/daily-state"
@@ -50,6 +55,17 @@ valid_id() {
 		????????????) case "$1" in *[!0-9a-f]*) return 1 ;; *) return 0 ;; esac ;;
 		*) return 1 ;;
 	esac
+}
+
+transition_lock_acquire() {
+	[ ! -L "$TRANSITION_LOCK" ] || return 1
+	exec 8>"$TRANSITION_LOCK" || return 1
+	flock -x 8 || { exec 8>&-; return 1; }
+}
+
+transition_lock_release() {
+	flock -u 8
+	exec 8>&-
 }
 
 write_runtime() {
@@ -257,8 +273,11 @@ persist_boot_id() {
 }
 
 load_migration_hold() {
-	local day mode
+	local day mode id quota count=0
 	migration_active=0
+	migration_release_requested=0
+	migration_release_ids=''
+	migration_release_quota=''
 	migration_marker_day=''
 	[ -e "$MIGRATION_FILE" ] || return 0
 	[ -f "$MIGRATION_FILE" ] && [ ! -L "$MIGRATION_FILE" ] || return 1
@@ -267,10 +286,27 @@ load_migration_hold() {
 	case "$day" in ????-??-??) ;; *) return 1 ;; esac
 	# An interrupted build anterior pudo dejar sólo day/used. Trátelo también
 	# como identidad desconocida; nunca reutilice el agregado como cuota propia.
-	case "$mode" in ''|identity-unknown-hold) ;; *) return 1 ;; esac
+	case "$mode" in
+		''|identity-unknown-hold) ;;
+		identity-zero-release)
+			[ "$(grep -c '^quota_bytes=' "$MIGRATION_FILE")" = '1' ] || return 1
+			quota="$(sed -n 's/^quota_bytes=//p' "$MIGRATION_FILE" | sed -n '1p')"
+			is_uint "$quota" && uint_ge "$quota" 100000000 && uint_ge 1000000000000 "$quota" || return 1
+			migration_release_quota="$quota"
+			for id in $(sed -n 's/^device=//p' "$MIGRATION_FILE"); do
+				valid_id "$id" || return 1
+				case " $migration_release_ids " in *" $id "*) return 1 ;; esac
+				migration_release_ids="${migration_release_ids}${migration_release_ids:+ }$id"
+				count=$((count + 1))
+			done
+			[ "$count" -gt 0 ] || return 1
+			migration_release_requested=1
+			;;
+		*) return 1 ;;
+	esac
 	# Never unlink an older marker here. It may be the only durable evidence that
-	# inherited per-device checkpoints are untrustworthy. A verified reset below
-	# is the sole transition allowed to clear it.
+	# inherited per-device checkpoints are untrustworthy. Only a verified reset
+	# or the explicit zero-release transition below may clear it.
 	[ "$day" = "$period_day" ] || [ "$period_day" \> "$day" ] || return 1
 	migration_marker_day="$day"
 	migration_active=1
@@ -354,8 +390,11 @@ quota_bytes_for() {
 }
 
 write_current_snapshot() {
-	local tmp="$SNAPSHOT_FILE.tmp" tab id mac ip name used limit bonus down up
+	local tmp="$SNAPSHOT_FILE.tmp" tab id mac ip name used limit bonus down up topology_sha256 expected_sha256
 	[ ! -L "$SNAPSHOT_FILE" ] || return 1
+	topology_sha256="$(topology_fingerprint)" || return 1
+	expected_sha256="$(expected_topology_fingerprint)" || return 1
+	[ -n "$topology_sha256" ] && [ "$topology_sha256" = "$expected_sha256" ] || return 1
 	tab="$(printf '\t')"
 	{
 		printf 'updated_at=%s\n' "$(date +%s)"
@@ -366,6 +405,7 @@ write_current_snapshot() {
 		printf 'migration_hold=%s\n' "$migration_active"
 		printf 'reset_hour=%s\n' "$reset_hour"
 		printf 'reset_minute=%s\n' "$reset_minute"
+		printf 'topology_sha256=%s\n' "$topology_sha256"
 		printf 'internet_up=%s\n' "$internet_up"
 		printf 'internet_down=%s\n' "$internet_down"
 		printf 'priority_up=%s\n' "$priority_up"
@@ -403,6 +443,120 @@ read_counters() {
 		fi
 	done < "$DEVICES_FILE"
 	mv "$tmp" "$CURRENT_FILE"
+}
+
+release_gate_ok() {
+	local actual expected
+	actual="$(nft list table "$TABLE_FAMILY" "$RELEASE_GATE_TABLE" 2>/dev/null |
+		awk '{ gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>"); print }' |
+		sha256sum | awk '{ print $1 }')" || return 1
+	expected="$({
+		printf 'table %s %s {\n' "$TABLE_FAMILY" "$RELEASE_GATE_TABLE"
+		printf '\tcomment "%s"\n' "$RELEASE_GATE_OWNER"
+		printf '\tchain freeze_forward {\n'
+		printf '\t\ttype filter hook forward priority filter - 7; policy accept;\n'
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$lan_if" "$wan_if"
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$wan_if" "$lan_if"
+		printf '\t}\n}\n'
+	} | sha256sum | awk '{ print $1 }')" || return 1
+	[ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+install_release_gate() {
+	if nft list table "$TABLE_FAMILY" "$RELEASE_GATE_TABLE" >/dev/null 2>&1; then
+		release_gate_ok
+		return
+	fi
+	nft -f - <<EOF || return 1
+table $TABLE_FAMILY $RELEASE_GATE_TABLE {
+	comment "$RELEASE_GATE_OWNER"
+	chain freeze_forward {
+		type filter hook forward priority -7; policy accept;
+		iifname "$lan_if" oifname "$wan_if" counter drop
+		iifname "$wan_if" oifname "$lan_if" counter drop
+	}
+}
+EOF
+	release_gate_ok
+}
+
+remove_release_gate() {
+	nft list table "$TABLE_FAMILY" "$RELEASE_GATE_TABLE" >/dev/null 2>&1 || return 0
+	release_gate_ok || return 1
+	nft delete table "$TABLE_FAMILY" "$RELEASE_GATE_TABLE" || return 1
+	! nft list table "$TABLE_FAMILY" "$RELEASE_GATE_TABLE" >/dev/null 2>&1
+}
+
+reset_gate_ok() {
+	local actual expected
+	actual="$(nft list table "$TABLE_FAMILY" "$RESET_GATE_TABLE" 2>/dev/null |
+		awk '{ gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>"); print }' |
+		sha256sum | awk '{ print $1 }')" || return 1
+	expected="$({
+		printf 'table %s %s {\n' "$TABLE_FAMILY" "$RESET_GATE_TABLE"
+		printf '\tcomment "%s"\n' "$RESET_GATE_OWNER"
+		printf '\tchain freeze_forward {\n'
+		printf '\t\ttype filter hook forward priority filter - 7; policy accept;\n'
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$lan_if" "$wan_if"
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$wan_if" "$lan_if"
+		printf '\t}\n}\n'
+	} | sha256sum | awk '{ print $1 }')" || return 1
+	[ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+install_reset_gate() {
+	if nft list table "$TABLE_FAMILY" "$RESET_GATE_TABLE" >/dev/null 2>&1; then
+		reset_gate_ok
+		return
+	fi
+	nft -f - <<EOF || return 1
+table $TABLE_FAMILY $RESET_GATE_TABLE {
+	comment "$RESET_GATE_OWNER"
+	chain freeze_forward {
+		type filter hook forward priority -7; policy accept;
+		iifname "$lan_if" oifname "$wan_if" counter drop
+		iifname "$wan_if" oifname "$lan_if" counter drop
+	}
+}
+EOF
+	reset_gate_ok
+}
+
+remove_reset_gate() {
+	nft list table "$TABLE_FAMILY" "$RESET_GATE_TABLE" >/dev/null 2>&1 || return 0
+	reset_gate_ok || return 1
+	nft delete table "$TABLE_FAMILY" "$RESET_GATE_TABLE" || return 1
+	! nft list table "$TABLE_FAMILY" "$RESET_GATE_TABLE" >/dev/null 2>&1
+}
+
+gate_counters_stable() {
+	local gate_checker="$1" require_zero="$2"
+	local first_internet_up first_internet_down first_priority_up first_priority_down
+	local first_others_up first_others_down first_devices
+	"$gate_checker" || return 1
+	read_counters || return 1
+	[ "$require_zero" != '1' ] || [ "$device_total_used" = '0' ] || return 1
+	first_internet_up="$internet_up"; first_internet_down="$internet_down"
+	first_priority_up="$priority_up"; first_priority_down="$priority_down"
+	first_others_up="$others_up"; first_others_down="$others_down"
+	first_devices="$(sha256sum "$CURRENT_FILE" 2>/dev/null | awk '{ print $1 }')"
+	[ -n "$first_devices" ] || return 1
+	sleep 1
+	"$gate_checker" || return 1
+	read_counters || return 1
+	[ "$require_zero" != '1' ] || [ "$device_total_used" = '0' ] || return 1
+	[ "$internet_up" = "$first_internet_up" ] && [ "$internet_down" = "$first_internet_down" ] || return 1
+	[ "$priority_up" = "$first_priority_up" ] && [ "$priority_down" = "$first_priority_down" ] || return 1
+	[ "$others_up" = "$first_others_up" ] && [ "$others_down" = "$first_others_down" ] || return 1
+	[ "$(sha256sum "$CURRENT_FILE" 2>/dev/null | awk '{ print $1 }')" = "$first_devices" ]
+}
+
+release_counters_stable() {
+	gate_counters_stable release_gate_ok 1
+}
+
+reset_counters_stable() {
+	gate_counters_stable reset_gate_ok 0
 }
 
 topology_fingerprint() {
@@ -651,10 +805,31 @@ reset_threshold_reached_for_day() {
 	[ "$now_minute" -ge "$reset_at_minute" ]
 }
 
-complete_period_reset() {
-	local target_day="$1" name releasing_migration=0
+validate_migration_release_policy() {
+	local tab id mac ip name count=0 expected_count=0
+	[ "$migration_active" = '1' ] && [ "$migration_release_requested" = '1' ] || return 1
+	[ "$quota_bytes" = "$migration_release_quota" ] || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		case " $migration_release_ids " in *" $id "*) ;; *) return 1 ;; esac
+		resolve_device_policy "$id" "$mac" || return 1
+		[ "$POLICY_LIMIT_BYTES" = "$migration_release_quota" ] && [ "$POLICY_BONUS_BYTES" = '0' ] || return 1
+		count=$((count + 1))
+	done < "$DEVICES_FILE"
+	for id in $migration_release_ids; do expected_count=$((expected_count + 1)); done
+	[ "$count" = "$expected_count" ]
+}
+
+complete_period_reset_inner() {
+	local target_day="$1" name releasing_migration=0 finish_rc=0
 	write_runtime applying 'Reiniciando de forma durable el periodo diario.' || return 1
+	install_reset_gate || return 1
+	reset_counters_stable || return 1
 	period_day="$target_day"
+	if [ "$migration_release_requested" = '1' ]; then
+		validate_migration_release_policy || return 1
+	fi
 	for name in internet_up internet_down priority_up priority_down others_up others_down; do eval "$name=0"; done
 	deliberate_daily_reset=1
 	[ "$migration_active" = '1' ] && [ -n "$migration_marker_day" ] && releasing_migration=1
@@ -671,6 +846,7 @@ complete_period_reset() {
 	# the migration marker still exists. The marker is removed last, so any
 	# interrupted transition restarts fail-closed and cannot restore old values.
 	rm -rf "$DEVICE_STATE_DIR" || return 1
+	reset_gate_ok || return 1
 	persist_values || return 1
 	persist_table_ids || return 1
 	if [ "$releasing_migration" = '1' ]; then
@@ -685,14 +861,95 @@ complete_period_reset() {
 		verified_at="$(date +%s)"
 		last_verify_epoch="$verified_at"
 	fi
+	reset_gate_ok || return 1
 	write_current_snapshot || return 1
+	reset_gate_ok || return 1
 	rm -f "$MIGRATION_FILE" || return 1
 	sync || return 1
 	migration_marker_day=''
 	migration_active=0
+	migration_release_requested=0
+	migration_release_ids=''
+	migration_release_quota=''
 	deliberate_daily_reset=0
 	force_degraded=0
 	live_table_present=1
+	finish_rc=0
+	remove_reset_gate || finish_rc=1
+	[ "$finish_rc" = '0' ]
+}
+
+complete_period_reset() {
+	local rc
+	transition_lock_acquire || return 1
+	complete_period_reset_inner "$@"
+	rc=$?
+	transition_lock_release
+	return "$rc"
+}
+
+release_migration_hold_now_inner() {
+	local tab id mac ip name used file day saved_mac saved_used saved_reserved
+	[ "$migration_active" = '1' ] && [ "$migration_release_requested" = '1' ] || return 0
+	write_runtime applying 'Liberando de forma durable la migración desde consumo individual cero.' || return 1
+	validate_migration_release_policy || return 1
+
+	# The currently installed hold does not reference any quota object, so every
+	# device must still be at the exact zero checkpoint persisted by main().
+	verify_runtime || return 1
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		used="$(quota_used_for "$id")" || return 1
+		[ "$used" = '0' ] || return 1
+		file="$DEVICE_STATE_DIR/$id"
+		[ -f "$file" ] && [ ! -L "$file" ] || return 1
+		day="$(sed -n 's/^day=//p' "$file" | sed -n '1p')"
+		saved_mac="$(sed -n 's/^mac=//p' "$file" | sed -n '1p')"
+		saved_used="$(sed -n 's/^used=//p' "$file" | sed -n '1p')"
+		saved_reserved="$(sed -n 's/^reserved=//p' "$file" | sed -n '1p')"
+		[ "$day" = "$period_day" ] && [ "$saved_mac" = "$mac" ] && [ "$saved_used" = '0' ] && [ "$saved_reserved" = '0' ] || return 1
+	done < "$DEVICES_FILE"
+	# The release gate must make two complete live reads identical before the
+	# table replacement. This proves there is no packet window whose aggregate
+	# or per-device consumption could disappear during the transition.
+	release_counters_stable || return 1
+
+	# Build the normal classifier from the durable zero checkpoints. The marker
+	# remains until the normal table, readback and fresh checkpoints all succeed;
+	# an interrupted attempt therefore re-enters the hold on restart.
+	migration_active=0
+	live_table_present=0
+	rm -f "$LIVE_SEEDS_FILE" "$LIVE_SEEDS_FILE.tmp" || return 1
+	install_table || return 1
+	live_table_present=1
+	read_counters || return 1
+	verify_runtime || return 1
+	verified_at="$(date +%s)"
+	last_verify_epoch="$verified_at"
+	release_gate_ok || return 1
+	write_current_snapshot || return 1
+	release_gate_ok || return 1
+	persist_values || return 1
+	persist_table_ids || return 1
+	release_gate_ok || return 1
+	rm -f "$MIGRATION_FILE" || return 1
+	sync || return 1
+	[ ! -e "$MIGRATION_FILE" ] || return 1
+	migration_marker_day=''
+	migration_release_requested=0
+	migration_release_ids=''
+	migration_release_quota=''
+	force_degraded=0
+}
+
+release_migration_hold_now() {
+	local rc
+	transition_lock_acquire || return 1
+	release_migration_hold_now_inner "$@"
+	rc=$?
+	transition_lock_release
+	return "$rc"
 }
 
 reset_period_if_due() {
@@ -793,6 +1050,16 @@ main() {
 	persist_values || { handle_persist_failure; exit 1; }
 	persist_table_ids || { handle_persist_failure; exit 1; }
 	persist_boot_id || { handle_persist_failure; exit 1; }
+	if [ "$migration_release_requested" = '1' ] && nft list table "$TABLE_FAMILY" "$RELEASE_GATE_TABLE" >/dev/null 2>&1; then
+		release_migration_hold_now || { write_runtime error 'No se pudo completar la liberación durable desde cero.'; exit 1; }
+	fi
+	# A crash after committing a daily reset may leave only its volatile gate.
+	# With no migration marker, the normal table and checkpoints above are the
+	# authoritative recovered state; remove that exact gate without resetting.
+	if nft list table "$TABLE_FAMILY" "$RESET_GATE_TABLE" >/dev/null 2>&1; then
+		[ "$migration_active" = '0' ] || { write_runtime error 'La gate de reset sigue activa con una migración pendiente.'; exit 1; }
+		remove_reset_gate || { write_runtime error 'No se pudo retirar la gate verificada de un reset completado.'; exit 1; }
+	fi
 	rm -f "$HANDOFF_FILE" "$LIVE_SEEDS_FILE"
 	trap cleanup TERM INT
 	last_persist_epoch="$(date +%s)"

@@ -2,10 +2,10 @@ include $(TOPDIR)/rules.mk
 
 PKG_LICENSE:=MIT
 PKG_VERSION:=1.4.0
-PKG_RELEASE:=18
+PKG_RELEASE:=21
 
 LUCI_TITLE:=Monitor ligero de red para NanoStation M5
-LUCI_DESCRIPTION:=Pruebas HTTP públicas, cuotas WAN individuales y límites prioritarios para NanoStation M5
+LUCI_DESCRIPTION:=Pruebas HTTP públicas, cuotas WAN y límites individuales sólo para Otros en NanoStation M5
 LUCI_DEPENDS:=+luci-base +libcurl +ca-bundle +tc-tiny +busybox
 LUCI_MAINTAINER:=RaykTo <raktodev@gmail.com>, RaykTo <raykto@aol.com>
 LUCI_URL:=mailto:raktodev@gmail.com

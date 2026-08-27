@@ -1,0 +1,324 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 RaykTo <raktodev@gmail.com>
+
+. /lib/functions.sh
+. /usr/libexec/nano-monitor/device-policy
+
+STATE_DIR='/etc/nano-monitor'
+MARKER="$STATE_DIR/v4-migration"
+SNAPSHOT='/var/run/nano-accounting/current-snapshot'
+REGISTRY='/usr/libexec/nano-monitor/device-registry'
+RECONCILE='/etc/hotplug.d/dhcp/95-nano-shaper'
+RPC_HELPER='/usr/libexec/rpcd/luci.nano-monitor'
+LOCK='/var/run/nano-release-migration.lock'
+RECONCILE_LOCK='/var/run/nano-reconcile.lock'
+TRANSITION_LOCK='/var/run/nano-accounting-transition.lock'
+GATE_FAMILY='inet'
+GATE_TABLE='nano_release_gate'
+GATE_OWNER='nano-monitor-release-v1'
+gate_armed=0
+
+fail() {
+	if [ "$gate_armed" = '1' ]; then
+		printf 'release-migration-hold: operación segura pendiente: %s Repita el mismo comando; el acceso local sigue disponible y el tráfico reenviado permanece congelado.\n' "$1" >&2
+		exit 2
+	fi
+	printf 'release-migration-hold: %s\n' "$1" >&2
+	exit 1
+}
+
+valid_iface() {
+	case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; *) return 0 ;; esac
+}
+
+release_gate_owned() {
+	nft list table "$GATE_FAMILY" "$GATE_TABLE" 2>/dev/null | grep -Fq "comment \"$GATE_OWNER\""
+}
+
+release_gate_fingerprint() {
+	nft list table "$GATE_FAMILY" "$GATE_TABLE" 2>/dev/null |
+		awk '{ gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>"); print }' |
+		sha256sum | awk '{ print $1 }'
+}
+
+expected_release_gate_fingerprint() {
+	{
+		printf 'table %s %s {\n' "$GATE_FAMILY" "$GATE_TABLE"
+		printf '\tcomment "%s"\n' "$GATE_OWNER"
+		printf '\tchain freeze_forward {\n'
+		printf '\t\ttype filter hook forward priority filter - 7; policy accept;\n'
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$lan_if" "$wan_if"
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$wan_if" "$lan_if"
+		printf '\t}\n}\n'
+	} | sha256sum | awk '{ print $1 }'
+}
+
+release_gate_ok() {
+	local actual expected
+	actual="$(release_gate_fingerprint)" || return 1
+	expected="$(expected_release_gate_fingerprint)" || return 1
+	[ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+install_release_gate() {
+	if nft list table "$GATE_FAMILY" "$GATE_TABLE" >/dev/null 2>&1; then
+		release_gate_owned && release_gate_ok || return 1
+		gate_armed=1
+		return 0
+	fi
+	nft -f - <<EOF || return 1
+table $GATE_FAMILY $GATE_TABLE {
+	comment "$GATE_OWNER"
+	chain freeze_forward {
+		type filter hook forward priority -7; policy accept;
+		iifname "$lan_if" oifname "$wan_if" counter drop
+		iifname "$wan_if" oifname "$lan_if" counter drop
+	}
+}
+EOF
+	gate_armed=1
+	release_gate_ok || return 1
+}
+
+remove_release_gate() {
+	nft list table "$GATE_FAMILY" "$GATE_TABLE" >/dev/null 2>&1 || { gate_armed=0; return 0; }
+	release_gate_ok || return 1
+	nft delete table "$GATE_FAMILY" "$GATE_TABLE" || return 1
+	! nft list table "$GATE_FAMILY" "$GATE_TABLE" >/dev/null 2>&1 || return 1
+	gate_armed=0
+}
+
+marker_release_matches() {
+	local id count=0 seen=''
+	[ "$(grep -c '^day=' "$MARKER")" = '1' ] || return 1
+	[ "$(grep -c '^mode=' "$MARKER")" = '1' ] || return 1
+	[ "$(sed -n 's/^mode=//p' "$MARKER" | sed -n '1p')" = 'identity-zero-release' ] || return 1
+	[ "$(grep -c '^quota_bytes=' "$MARKER")" = '1' ] || return 1
+	[ "$(sed -n 's/^quota_bytes=//p' "$MARKER" | sed -n '1p')" = "$expected_quota" ] || return 1
+	for id in $(sed -n 's/^device=//p' "$MARKER"); do
+		valid_id "$id" || return 1
+		case " $expected_ids " in *" $id "*) ;; *) return 1 ;; esac
+		case " $seen " in *" $id "*) return 1 ;; esac
+		seen="${seen}${seen:+ }$id"
+		count=$((count + 1))
+	done
+	[ "$count" = "$expected_count" ] || return 1
+	for id in $expected_ids; do
+		case " $seen " in *" $id "*) ;; *) return 1 ;; esac
+	done
+	[ "$(wc -l < "$MARKER")" = "$((expected_count + 3))" ]
+}
+
+is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+valid_id() {
+	case "$1" in
+		????????????) case "$1" in *[!0-9a-f]*) return 1 ;; *) return 0 ;; esac ;;
+		*) return 1 ;;
+	esac
+}
+
+[ "$(id -u)" = '0' ] || fail 'se requiere root.'
+[ "$#" -ge 3 ] || fail 'uso: release-migration-hold --confirm-zero CUOTA_BYTES DEVICE_ID [DEVICE_ID ...]'
+[ "$1" = '--confirm-zero' ] || fail 'falta la confirmación explícita --confirm-zero.'
+shift
+expected_quota="$1"
+shift
+is_uint "$expected_quota" || fail 'la cuota esperada no es un entero.'
+
+expected_ids=''
+expected_count=0
+for device_id in "$@"; do
+	valid_id "$device_id" || fail "ID de dispositivo no válido: $device_id"
+	case " $expected_ids " in *" $device_id "*) fail "ID repetido: $device_id" ;; esac
+	expected_ids="${expected_ids}${expected_ids:+ }$device_id"
+	expected_count=$((expected_count + 1))
+done
+
+command -v flock >/dev/null 2>&1 || fail 'flock no está disponible.'
+command -v nft >/dev/null 2>&1 && command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 || fail 'faltan nft, ubus, jsonfilter o sha256sum.'
+[ ! -L "$LOCK" ] || fail 'el lock no es seguro.'
+exec 9>"$LOCK" || fail 'no se pudo abrir el lock.'
+flock -n 9 || fail 'ya existe otra liberación en curso.'
+
+[ -x "$REGISTRY" ] && [ -x "$RECONCILE" ] && [ -x "$RPC_HELPER" ] || fail 'faltan los ejecutores mantenidos.'
+[ -f "$SNAPSHOT" ] && [ ! -L "$SNAPSHOT" ] || fail 'no existe un snapshot regular de contabilidad.'
+snapshot_day="$(sed -n 's/^day=//p' "$SNAPSHOT" | sed -n '1p')"
+case "$snapshot_day" in ????-??-??) ;; *) fail 'el día de contabilidad no es válido.' ;; esac
+
+config_load bwlimit
+config_get quota_bytes main quota_per_device_bytes '700000000'
+config_get base_down main other_down_kbit '768'
+config_get base_up main other_up_kbit '128'
+config_get total_down main total_down_kbit '8800'
+config_get total_up main total_up_kbit '4200'
+config_get degraded main other_degraded_kbit '64'
+config_get lan_if main lan_if 'br-lan'
+config_get wan_network main wan_network 'provider'
+[ "$quota_bytes" = "$expected_quota" ] || fail 'la cuota configurada no coincide con la autorización.'
+valid_iface "$lan_if" && valid_iface "$wan_network" || fail 'las interfaces configuradas no son válidas.'
+wan_if="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+valid_iface "$wan_if" || fail 'no se pudo resolver la interfaz WAN efectiva.'
+
+if nft list table "$GATE_FAMILY" "$GATE_TABLE" >/dev/null 2>&1; then
+	release_gate_owned && release_gate_ok || fail 'existe una protección de liberación que no coincide con la firma propia.'
+	gate_armed=1
+fi
+[ "$gate_armed" = '1' ] || [ "$(cat /var/run/nano-accounting/state 2>/dev/null)" = 'active' ] || fail 'la contabilidad no está activa.'
+
+marker_mode=''
+marker_day=''
+if [ -e "$MARKER" ]; then
+	[ -f "$MARKER" ] && [ ! -L "$MARKER" ] || fail 'el marker de migración no es seguro.'
+	marker_day="$(sed -n 's/^day=//p' "$MARKER" | sed -n '1p')"
+	marker_mode="$(sed -n 's/^mode=//p' "$MARKER" | sed -n '1p')"
+	case "$marker_day" in ????-??-??) ;; *) fail 'el día del hold no es válido.' ;; esac
+	if [ "$marker_day" != "$snapshot_day" ]; then
+		[ "$gate_armed" = '1' ] && [ "$snapshot_day" \> "$marker_day" ] || fail 'el hold y la contabilidad pertenecen a días incompatibles.'
+	fi
+	case "$marker_mode" in
+		''|identity-unknown-hold)
+			[ "$(sed -n 's/^migration_hold=//p' "$SNAPSHOT" | sed -n '1p')" = '1' ] || [ "$gate_armed" = '1' ] || fail 'el snapshot no confirma el hold.'
+			;;
+		identity-zero-release)
+			marker_release_matches || fail 'la autorización durable existente no coincide con este comando.'
+			;;
+		*) fail 'el marker no está en un modo liberable.' ;;
+	esac
+else
+	[ "$gate_armed" = '1' ] || fail 'no existe un hold ni una liberación pendiente.'
+	[ "$(sed -n 's/^migration_hold=//p' "$SNAPSHOT" | sed -n '1p')" = '0' ] || fail 'falta el marker pero el snapshot aún declara el hold.'
+	marker_mode='released-recovery'
+	marker_day="$snapshot_day"
+fi
+
+registry="$($REGISTRY)" || fail 'no se pudo resolver el registro de dispositivos.'
+actual_ids=''
+actual_count=0
+tab="$(printf '\t')"
+while IFS="$tab" read -r device_id mac ip name; do
+	[ -z "$device_id" ] && continue
+	valid_id "$device_id" || fail 'el registro devolvió un ID no válido.'
+	case " $expected_ids " in *" $device_id "*) ;; *) fail "dispositivo no autorizado en el registro: $device_id" ;; esac
+	case " $actual_ids " in *" $device_id "*) fail "dispositivo repetido en el registro: $device_id" ;; esac
+	load_device_policy "$device_id" "$mac" "$snapshot_day" "$quota_bytes" "$base_down" "$base_up" "$total_down" "$total_up" "$degraded" || fail "política no válida para $device_id"
+	[ "$POLICY_LIMIT_BYTES" = "$expected_quota" ] && [ "$POLICY_BONUS_BYTES" = '0' ] || fail "la cuota efectiva de $device_id no parte del valor autorizado."
+	actual_ids="${actual_ids}${actual_ids:+ }$device_id"
+	actual_count=$((actual_count + 1))
+done <<EOF
+$registry
+EOF
+
+for device_id in $expected_ids; do
+	case " $actual_ids " in *" $device_id "*) ;; *) fail "dispositivo autorizado ausente del registro: $device_id" ;; esac
+done
+[ "$actual_count" = "$expected_count" ] || fail 'el conjunto de dispositivos no coincide exactamente.'
+
+[ ! -L "$RECONCILE_LOCK" ] || fail 'el lock de reconciliación no es seguro.'
+exec 8>"$RECONCILE_LOCK" || fail 'no se pudo abrir el lock de reconciliación.'
+attempt=0
+while ! flock -n 8; do
+	[ "$attempt" -lt 30 ] || fail 'la reconciliación sigue ocupada.'
+	attempt=$((attempt + 1))
+	sleep 1
+done
+
+[ ! -L "$TRANSITION_LOCK" ] || fail 'el lock de transición no es seguro.'
+exec 7>"$TRANSITION_LOCK" || fail 'no se pudo abrir el lock de transición.'
+attempt=0
+while ! flock -n 7; do
+	[ "$attempt" -lt 30 ] || fail 'una transición de contabilidad sigue ocupada.'
+	attempt=$((attempt + 1))
+	sleep 1
+done
+
+# Freeze every forwarded WAN/LAN packet before publishing the authorization.
+# This closes both aggregate-counter and per-device crash windows while local
+# router access remains available.
+install_release_gate || fail 'no se pudo instalar y verificar la congelación transitoria.'
+
+# The daemon holds this same transition lock for the whole daily reset and the
+# immediate release. Re-reading now can neither interrupt nor race either one.
+[ -f "$SNAPSHOT" ] && [ ! -L "$SNAPSHOT" ] || fail 'el snapshot desapareció durante la transición.'
+fresh_snapshot_day="$(sed -n 's/^day=//p' "$SNAPSHOT" | sed -n '1p')"
+case "$fresh_snapshot_day" in ????-??-??) ;; *) fail 'el periodo cambió a un valor no válido durante la transición.' ;; esac
+[ "$fresh_snapshot_day" = "$snapshot_day" ] || fail 'el periodo cambió mientras se preparaba la liberación; repita el mismo comando.'
+if [ -e "$MARKER" ]; then
+	[ -f "$MARKER" ] && [ ! -L "$MARKER" ] || fail 'el marker cambió a un objeto no seguro.'
+	marker_day="$(sed -n 's/^day=//p' "$MARKER" | sed -n '1p')"
+	marker_mode="$(sed -n 's/^mode=//p' "$MARKER" | sed -n '1p')"
+	case "$marker_day" in ????-??-??) ;; *) fail 'el marker cambió a un día no válido.' ;; esac
+	[ "$marker_day" = "$snapshot_day" ] || [ "$snapshot_day" \> "$marker_day" ] || fail 'el marker cambió a un periodo incompatible.'
+	case "$marker_mode" in
+		''|identity-unknown-hold) ;;
+		identity-zero-release) marker_release_matches || fail 'la autorización durable cambió durante la transición.' ;;
+		*) fail 'el marker cambió a un modo no liberable.' ;;
+	esac
+else
+	[ "$(sed -n 's/^migration_hold=//p' "$SNAPSHOT" | sed -n '1p')" = '0' ] || fail 'el reset retiró el marker sin publicar todavía su snapshot final.'
+	marker_mode='released-recovery'
+	marker_day="$snapshot_day"
+fi
+
+if [ "$marker_mode" != 'identity-zero-release' ] && [ "$marker_mode" != 'released-recovery' ]; then
+	[ ! -L "$MARKER.tmp" ] || fail 'el marker temporal no es seguro.'
+	umask 077
+	if ! {
+		{
+			printf 'day=%s\n' "$marker_day"
+			printf 'mode=identity-zero-release\n'
+			printf 'quota_bytes=%s\n' "$expected_quota"
+			for device_id in $expected_ids; do printf 'device=%s\n' "$device_id"; done
+		} > "$MARKER.tmp" && mv "$MARKER.tmp" "$MARKER" && sync
+	}; then
+		if ! marker_release_matches; then
+			remove_release_gate || fail 'falló la autorización y no se pudo retirar la congelación.'
+		fi
+		fail 'no se pudo guardar la autorización durable.'
+	fi
+	marker_mode='identity-zero-release'
+fi
+
+[ "$marker_mode" = 'released-recovery' ] || marker_release_matches || fail 'el readback de la autorización durable no coincide.'
+flock -u 7
+exec 7>&-
+flock -u 8
+exec 8>&-
+
+# A busy reconciler may return after only queuing our event. Wait for the real
+# completion instead of reporting a false failure while the authorization can
+# still execute asynchronously.
+"$RECONCILE" reconcile >/dev/null 2>&1
+attempt=0
+while [ "$attempt" -lt 60 ]; do
+	if [ ! -e "$MARKER" ] &&
+		[ "$(cat /var/run/nano-accounting/state 2>/dev/null)" = 'active' ] &&
+		[ "$(cat /var/run/nano-shaper/state 2>/dev/null)" = 'active' ] &&
+		[ "$(sed -n 's/^migration_hold=//p' "$SNAPSHOT" | sed -n '1p')" = '0' ]; then
+		break
+	fi
+	attempt=$((attempt + 1))
+	sleep 1
+done
+[ "$attempt" -lt 60 ] || fail 'la reconciliación no ha publicado todavía el estado final.'
+
+[ "$(grep -c '^device'"$(printf '\t')" "$SNAPSHOT")" = "$expected_count" ] || fail 'el snapshot final no contiene el conjunto exacto de dispositivos.'
+for device_id in $expected_ids; do
+	awk -F '\t' -v wanted="$device_id" -v quota="$expected_quota" '
+		$1 == "device" && $2 == wanted && $6 == 0 && $7 == quota && $8 == 0 { ok=1 }
+		END { exit !ok }
+	' "$SNAPSHOT" || fail "el readback final de $device_id no coincide."
+done
+
+# Reuse the complete RPC verifier directly while allowing only this exact,
+# already-verified release gate. Public ubus readback continues rejecting any
+# gate, so clients never see a frozen path as applied.
+shaper_json="$(printf '%s' '{}' | NANO_RELEASE_READBACK=1 "$RPC_HELPER" call shaper 2>/dev/null)" || fail 'la liberación terminó, pero falló el readback interno del shaper.'
+[ "$(printf '%s' "$shaper_json" | jsonfilter -e '@.verified' 2>/dev/null)" = '1' ] &&
+	[ "$(printf '%s' "$shaper_json" | jsonfilter -e '@.applied' 2>/dev/null)" = '1' ] || fail 'la liberación terminó, pero el shaper no superó el readback interno.'
+remove_release_gate || fail 'la transición terminó, pero no se pudo retirar la congelación propia.'
+
+printf 'Hold liberado y verificado para %s dispositivo(s) desde cuota base %s.\n' "$expected_count" "$expected_quota"

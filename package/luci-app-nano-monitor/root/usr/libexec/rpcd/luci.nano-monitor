@@ -183,9 +183,46 @@ nft_quota_bytes() {
 	printf '%s' "$value"
 }
 
+rpc_nft_topology_fingerprint() {
+	local table="$1" rules
+	rules="$(nft list table inet "$table" 2>/dev/null)" || return 1
+	printf '%s\n' "$rules" |
+		awk '{
+			if ($0 ~ /^[[:space:]]*quota[[:space:]]+q_[^[:space:]]+[[:space:]]+\{$/)
+				in_quota = 1
+			gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>")
+			if (in_quota && $0 ~ /^[[:space:]]*[0-9]+ bytes used [0-9]+ bytes[[:space:]]*$/)
+				sub(/ used [0-9]+ bytes[[:space:]]*$/, "")
+			print
+			if (in_quota && $0 ~ /^[[:space:]]*\}[[:space:]]*$/)
+				in_quota = 0
+		}' |
+		sha256sum | awk '{ print $1 }'
+}
+
+rpc_tc_topology_fingerprint() {
+	local dev="$1" qdisc classes
+	case "$dev" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
+	qdisc="$(tc qdisc show dev "$dev" 2>/dev/null)" || return 1
+	classes="$(tc class show dev "$dev" 2>/dev/null)" || return 1
+	# Match nano-shaper's canonical topology: runtime counters and kernel leaf
+	# identifiers must not invalidate an otherwise unchanged live readback.
+	qdisc="$(printf '%s\n' "$qdisc" |
+		awk '{ gsub(/direct_packets_stat [0-9]+/, "direct_packets_stat <runtime>"); print }' |
+		sort)" || return 1
+	classes="$(printf '%s\n' "$classes" |
+		awk '/^class htb / { gsub(/ leaf [^ ]+/, " leaf <qdisc>"); print }' |
+		sort)" || return 1
+	[ -n "$qdisc" ] && [ -n "$classes" ] || return 1
+	printf 'qdisc=%s\nclasses=%s\n' "$qdisc" "$classes" | sha256sum | awk '{ print $1 }'
+}
+
 runtime_accounting_ok() {
-	local rules lan_if wan_network wan_if ip expected="$1" actual configured registry tab id mac name period_day other_down other_up total_down total_up degraded
+	local rules lan_if wan_network wan_if ip expected="$1" expected_topology="$2" actual configured registry tab id mac name period_day other_down other_up total_down total_up degraded expected_priority_sorted live_priority_sorted
 	[ "$(cat "$ACCOUNT_STATE_DIR/state" 2>/dev/null)" = 'active' ] || return 1
+	! nft list table inet nano_release_gate >/dev/null 2>&1 || return 1
+	! nft list table inet nano_accounting_reset_gate >/dev/null 2>&1 || return 1
+	! nft list table inet nano_shaper_gate >/dev/null 2>&1 || return 1
 	config_load bwlimit
 	[ "$(uci -q get bwlimit.main.quota_enabled)" = '1' ] || return 1
 	config_get lan_if main lan_if 'br-lan'
@@ -200,7 +237,13 @@ runtime_accounting_ok() {
 	is_uint "$configured" || return 1
 	wan_if="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	rules="$(nft list table inet nano_accounting 2>/dev/null)" || return 1
+	[ "${#expected_topology}" = '64' ] || return 1
+	case "$expected_topology" in *[!0-9a-f]*) return 1 ;; esac
+	[ "$(rpc_nft_topology_fingerprint nano_accounting)" = "$expected_topology" ] || return 1
 	printf '%s\n' "$rules" | grep -Fq 'comment "nano-monitor-accounting-v1"' || return 1
+	expected_priority_sorted="$(priority_words_sorted "$(uci -q get bwlimit.main.exempt_ip)")" || return 1
+	live_priority_sorted="$(nft_priority_words_sorted nano_accounting)" || return 1
+	[ -n "$expected_priority_sorted" ] && [ "$live_priority_sorted" = "$expected_priority_sorted" ] || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$lan_if\" oifname \"$wan_if\"" || return 1
 	printf '%s\n' "$rules" | grep -Fq "iifname \"$wan_if\" oifname \"$lan_if\"" || return 1
 	for ip in $(uci -q get bwlimit.main.exempt_ip); do
@@ -230,10 +273,60 @@ EOF
 	fi
 }
 
+runtime_accounting_live_registry() {
+	local snapshot_registry="$1" configured="$2" period_day="$3" expected_topology="$4" live tab id mac ip name row marker sid smac sip sname sused slimit sbonus sdown sup actual count=0 snapshot_count
+	runtime_accounting_ok "$configured" "$expected_topology" || return 1
+	[ -x "$DEVICE_REGISTRY" ] || return 1
+	live="$($DEVICE_REGISTRY)" || return 1
+	snapshot_count="$(printf '%s\n' "$snapshot_registry" | awk 'NF { count++ } END { print count + 0 }')"
+	tab="$(printf '\t')"
+	while IFS="$tab" read -r id mac ip name; do
+		[ -z "$id" ] && continue
+		row="$(printf '%s\n' "$snapshot_registry" | awk -F '\t' -v wanted="$id" '$1 == wanted { print }')"
+		[ "$(printf '%s\n' "$row" | awk 'NF { count++ } END { print count + 0 }')" = '1' ] || return 1
+		IFS="$tab" read -r sid smac sip sname sused slimit sbonus sdown sup <<EOF
+$row
+EOF
+		[ "$sid" = "$id" ] && [ "$smac" = "$mac" ] && [ "$sip" = "$ip" ] && [ "$sname" = "$name" ] || return 1
+		for marker in "$sused" "$slimit" "$sbonus" "$sdown" "$sup"; do is_uint "$marker" || return 1; done
+		load_device_policy "$id" "$mac" "$period_day" "$configured" "$configured_down" "$configured_up" "$configured_total_down" "$configured_total_up" "$configured_degraded" || return 1
+		[ "$slimit" = "$POLICY_LIMIT_BYTES" ] && [ "$sbonus" = "$POLICY_BONUS_BYTES" ] && [ "$sdown" = "$POLICY_DOWN_KBIT" ] && [ "$sup" = "$POLICY_UP_KBIT" ] || return 1
+		actual="$(nft_quota_bytes "$id")" || return 1
+		[ "$actual" = "$slimit" ] || return 1
+		actual="$(nft_quota_used "$id")" || return 1
+		uint_ge "$actual" "$sused" || return 1
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$mac" "$ip" "$name" "$actual" "$slimit" "$sbonus" "$sdown" "$sup"
+		count=$((count + 1))
+	done <<EOF
+$live
+EOF
+	[ "$count" = "$snapshot_count" ]
+}
+
+runtime_accounting_live_counters() {
+	local name snapshot live output=''
+	for name in internet_up internet_down priority_up priority_down others_up others_down; do
+		case "$name" in
+			internet_up) snapshot="$1" ;;
+			internet_down) snapshot="$2" ;;
+			priority_up) snapshot="$3" ;;
+			priority_down) snapshot="$4" ;;
+			others_up) snapshot="$5" ;;
+			others_down) snapshot="$6" ;;
+		esac
+		is_uint "$snapshot" || return 1
+		live="$(nft_counter_bytes "$name")" || return 1
+		uint_ge "$live" "$snapshot" || return 1
+		output="${output}${output:+ }$live"
+	done
+	printf '%s\n' "$output"
+}
+
 wait_accounting_quota() {
-	local expected="$1" attempt=0
+	local expected="$1" attempt=0 topology
 	while [ "$attempt" -lt 5 ]; do
-		runtime_accounting_ok "$expected" && return 0
+		topology="$(sed -n 's/^topology_sha256=//p' "$ACCOUNT_SNAPSHOT" 2>/dev/null | sed -n '1p')"
+		runtime_accounting_ok "$expected" "$topology" && return 0
 		attempt=$((attempt + 1))
 		sleep 1
 	done
@@ -250,7 +343,7 @@ restore_quota_value() {
 }
 
 method_accounting() {
-	local internet_up=0 internet_down=0 priority_up=0 priority_down=0 others_up=0 others_down=0 quota_bytes=700000000 quota_enabled=0 migration_hold=0 quota_used remaining verified period_day timezone reset_hour=0 reset_minute=1 reset_at data_ok=1 value registry tab id mac ip name used limit bonus down up left degraded device_count capacity bonus_total degraded_count account_state account_message updated_at verified_at now age snapshot line configured_quota configured_enabled configured_reset_hour configured_reset_minute configured_down configured_up configured_total_down configured_total_up configured_degraded generation_before generation_after
+	local internet_up=0 internet_down=0 priority_up=0 priority_down=0 others_up=0 others_down=0 quota_bytes=700000000 quota_enabled=0 migration_hold=0 quota_used remaining verified period_day timezone reset_hour=0 reset_minute=1 reset_at data_ok=1 value registry live_registry live_counters topology_sha256 tab id mac ip name used limit bonus down up left degraded device_count capacity bonus_total degraded_count account_state account_message updated_at verified_at now age snapshot line configured_quota configured_enabled configured_reset_hour configured_reset_minute configured_down configured_up configured_total_down configured_total_up configured_degraded generation_before generation_after generation_live verified_candidate=0
 	config_load bwlimit
 	config_get_bool configured_enabled main quota_enabled 1
 	config_get configured_quota main quota_per_device_bytes '700000000'
@@ -280,6 +373,7 @@ method_accounting() {
 			migration_hold=*) migration_hold="${line#*=}" ;;
 			reset_hour=*) reset_hour="${line#*=}" ;;
 			reset_minute=*) reset_minute="${line#*=}" ;;
+			topology_sha256=*) topology_sha256="${line#*=}" ;;
 			internet_up=*) internet_up="${line#*=}" ;;
 			internet_down=*) internet_down="${line#*=}" ;;
 			priority_up=*) priority_up="${line#*=}" ;;
@@ -315,6 +409,14 @@ EOF
 	else
 		data_ok=0
 	fi
+	if [ "$data_ok" = '1' ] && [ "$account_state" = 'active' ]; then
+		if live_registry="$(runtime_accounting_live_registry "$registry" "$quota_bytes" "$period_day" "$topology_sha256")" &&
+			live_counters="$(runtime_accounting_live_counters "$internet_up" "$internet_down" "$priority_up" "$priority_down" "$others_up" "$others_down")"; then
+			registry="$live_registry"
+			set -- $live_counters
+			[ "$#" = '6' ] && internet_up="$1" && internet_down="$2" && priority_up="$3" && priority_down="$4" && others_up="$5" && others_down="$6" && verified_candidate=1
+		fi
+	fi
 	quota_used=0
 	remaining=0
 	capacity=0
@@ -342,7 +444,10 @@ EOF
 $registry
 EOF
 	verified='0'
-	[ "$data_ok" = '1' ] && [ "$account_state" = 'active' ] && verified='1'
+	if [ "$verified_candidate" = '1' ] && transition_gates_absent; then
+		generation_live="$(cat "$ACCOUNT_STATE_DIR/generation" 2>/dev/null)"
+		[ "$generation_live" = "$generation_before" ] && is_uint "$generation_live" && [ $((generation_live % 2)) -eq 0 ] && verified='1'
+	fi
 	timezone="$(uci -q get system.@system[0].zonename)"
 	reset_at="$(printf '%02d:%02d' "$reset_hour" "$reset_minute" 2>/dev/null)"
 	[ -n "$reset_at" ] || reset_at='00:01'
@@ -470,6 +575,45 @@ EOF
 	[ "$valid" = '1' ]
 }
 
+priority_words_sorted() {
+	for ip in $1; do printf '%s\n' "$ip"; done | sort -u | awk 'NF { values = values (values ? " " : "") $0 } END { print values }'
+}
+
+nft_priority_words_sorted() {
+	local table="$1"
+	nft -j list set inet "$table" priority_v4 2>/dev/null |
+		jsonfilter -e '@.nftables[*].set.elem[*]' 2>/dev/null |
+		sort -u | awk 'NF { values = values (values ? " " : "") $0 } END { print values }'
+}
+
+rpc_release_gate_ok() {
+	local lan_if="$1" wan_if="$2" actual expected
+	actual="$(nft list table inet nano_release_gate 2>/dev/null |
+		awk '{ gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>"); print }' |
+		sha256sum | awk '{ print $1 }')" || return 1
+	expected="$({
+		printf 'table inet nano_release_gate {\n'
+		printf '\tcomment "nano-monitor-release-v1"\n'
+		printf '\tchain freeze_forward {\n'
+		printf '\t\ttype filter hook forward priority filter - 7; policy accept;\n'
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$lan_if" "$wan_if"
+		printf '\t\tiifname "%s" oifname "%s" counter packets <runtime> bytes <runtime> drop\n' "$wan_if" "$lan_if"
+		printf '\t}\n}\n'
+	} | sha256sum | awk '{ print $1 }')" || return 1
+	[ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+rpc_shaper_gates_ok() {
+	local lan_if="$1" wan_if="$2"
+	! nft list table inet nano_shaper_gate >/dev/null 2>&1 || return 1
+	! nft list table inet nano_accounting_reset_gate >/dev/null 2>&1 || return 1
+	if [ "${NANO_RELEASE_READBACK:-0}" = '1' ]; then
+		rpc_release_gate_ok "$lan_if" "$wan_if"
+	else
+		! nft list table inet nano_release_gate >/dev/null 2>&1
+	fi
+}
+
 rpc_ipv4_hex() {
 	awk -F. '{ printf "%02x%02x%02x%02x", $1, $2, $3, $4 }' <<EOF
 $1
@@ -495,12 +639,13 @@ rpc_filter_mapping_matches() {
 }
 
 rpc_other_classes_ok() {
-	local dev="$1" handle="$2" direction="$3" degraded="$4" tab id mac ip down up normal normal_id=101 slow_id=$((101 + SLOW_OFFSET))
+	local dev="$1" handle="$2" direction="$3" degraded="$4" forced="$5" tab id mac ip down up normal normal_id=101 slow_id=$((101 + SLOW_OFFSET))
 	[ -f "$SHAPER_STATE_DIR/devices" ] && [ ! -L "$SHAPER_STATE_DIR/devices" ] || return 1
 	tab="$(printf '\t')"
 	while IFS="$tab" read -r id mac ip down up; do
 		[ -z "$id" ] && continue
 		case "$direction" in down) normal="$down" ;; up) normal="$up" ;; *) return 1 ;; esac
+		[ -z "$forced" ] || normal="$forced"
 		is_uint "$normal" || return 1
 		tc_class_value_matches "$dev" "$handle:$normal_id" rate 125 || return 1
 		tc_class_value_matches "$dev" "$handle:$normal_id" ceil $((normal * 125)) || return 1
@@ -514,63 +659,84 @@ rpc_other_classes_ok() {
 }
 
 runtime_shaper_ok() {
-	local total_down total_up effective_down effective_up degraded priority_down priority_up wan_if lan_if wan_network current_wan rules account_rules ip id registry tab mac name normal_id slow_id
+	local expected_wan="$1" expected_total_down="$2" expected_total_up="$3" expected_other_down="$4" expected_other_up="$5" expected_degraded="$6" expected_other_count="$7" expected_priority_ips="$8" expected_nft_sha256="$9" expected_wan_tc_sha256="${10}" expected_lan_tc_sha256="${11}"
+	local total_down total_up configured_down configured_up effective_down effective_up degraded wan_if lan_if wan_network current_wan rules output_rules account_rules ip id registry tab mac name normal_id slow_id shaper_state forced_down forced_up actual_other_count=0 expected_priority_sorted live_priority_sorted
 	config_load bwlimit
 	config_get lan_if main lan_if 'br-lan'
 	config_get wan_network main wan_network 'provider'
 	config_get total_down main total_down_kbit
 	config_get total_up main total_up_kbit
+	config_get configured_down main other_down_kbit '768'
+	config_get configured_up main other_up_kbit '128'
 	config_get degraded main other_degraded_kbit '64'
 	effective_down="$(cat "$SHAPER_STATE_DIR/other_down_kbit" 2>/dev/null)"
 	effective_up="$(cat "$SHAPER_STATE_DIR/other_up_kbit" 2>/dev/null)"
-	priority_down="$(cat "$SHAPER_STATE_DIR/priority_down_kbit" 2>/dev/null)"
-	priority_up="$(cat "$SHAPER_STATE_DIR/priority_up_kbit" 2>/dev/null)"
-	[ -n "$total_down" ] && [ -n "$total_up" ] && [ -n "$effective_down" ] && [ -n "$effective_up" ] && [ -n "$degraded" ] && [ -n "$priority_down" ] && [ -n "$priority_up" ] || return 1
-	[ "$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)" = 'active' ] || return 1
+	[ -n "$total_down" ] && [ -n "$total_up" ] && [ -n "$effective_down" ] && [ -n "$effective_up" ] && [ -n "$degraded" ] || return 1
+	shaper_state="$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)"
+	case "$shaper_state" in
+		active)
+			[ "$effective_down" = "$configured_down" ] && [ "$effective_up" = "$configured_up" ] || return 1
+			forced_down=''; forced_up=''
+			;;
+		safe)
+			[ "$effective_down" = "$degraded" ] && [ "$effective_up" = "$degraded" ] || return 1
+			forced_down="$degraded"; forced_up="$degraded"
+			;;
+		*) return 1 ;;
+	esac
 	wan_if="$(cat "$SHAPER_STATE_DIR/wan_if" 2>/dev/null)"
+	[ "$expected_wan" = "$wan_if" ] && [ "$expected_total_down" = "$total_down" ] && [ "$expected_total_up" = "$total_up" ] || return 1
+	[ "$expected_other_down" = "$effective_down" ] && [ "$expected_other_up" = "$effective_up" ] && [ "$expected_degraded" = "$degraded" ] || return 1
+	[ "$expected_priority_ips" = "$(uci -q get bwlimit.main.exempt_ip)" ] || return 1
+	[ "$expected_other_count" = "$(cat "$SHAPER_STATE_DIR/other_count" 2>/dev/null)" ] || return 1
+	[ "$expected_other_count" = "$(awk -F '\t' 'NF { count++ } END { print count + 0 }' "$SHAPER_STATE_DIR/devices" 2>/dev/null)" ] || return 1
 	case "$wan_if:$lan_if:$wan_network" in *[!A-Za-z0-9_.:-]*) return 1 ;; esac
 	current_wan="$(ubus call "network.interface.$wan_network" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	[ "$current_wan" = "$wan_if" ] || return 1
 	command -v tc >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 || return 1
 	runtime_reservations_ok || return 1
-	! nft list table inet nano_shaper_gate >/dev/null 2>&1 || return 1
+	rpc_shaper_gates_ok "$lan_if" "$wan_if" || return 1
 	tc_root_default_ok "$wan_if" "$WAN_HANDLE" || return 1
 	tc_class_value_matches "$wan_if" "$WAN_HANDLE:1" ceil $((total_up * 125)) || return 1
 	tc_class_value_matches "$wan_if" "$WAN_HANDLE:$OWNER_CLASS" rate 125 || return 1
-	tc_class_value_matches "$wan_if" "$WAN_HANDLE:10" rate $((priority_up * 125)) || return 1
-	tc_class_value_matches "$wan_if" "$WAN_HANDLE:10" ceil $((total_up * 125)) || return 1
 	tc_class_value_matches "$wan_if" "$WAN_HANDLE:20" rate 125 || return 1
 	tc_class_value_matches "$wan_if" "$WAN_HANDLE:20" ceil $((degraded * 125)) || return 1
-	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc fq_codel 10:' || return 1
+	! tc class show dev "$wan_if" 2>/dev/null | grep -q "^class htb $WAN_HANDLE:10 " || return 1
+	! tc qdisc show dev "$wan_if" 2>/dev/null | grep -q "^qdisc fq_codel 10: parent $WAN_HANDLE:10 " || return 1
 	tc qdisc show dev "$wan_if" 2>/dev/null | grep -q 'qdisc fq_codel 20:' || return 1
 	tc_root_default_ok "$lan_if" "$LAN_HANDLE" || return 1
 	tc_class_value_matches "$lan_if" "$LAN_HANDLE:1" ceil $((total_down * 125)) || return 1
 	tc_class_value_matches "$lan_if" "$LAN_HANDLE:$OWNER_CLASS" rate 125 || return 1
-	tc_class_value_matches "$lan_if" "$LAN_HANDLE:10" rate $((priority_down * 125)) || return 1
-	tc_class_value_matches "$lan_if" "$LAN_HANDLE:10" ceil $((total_down * 125)) || return 1
 	tc_class_value_matches "$lan_if" "$LAN_HANDLE:20" rate 125 || return 1
 	tc_class_value_matches "$lan_if" "$LAN_HANDLE:20" ceil $((degraded * 125)) || return 1
-	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 10:' || return 1
+	! tc class show dev "$lan_if" 2>/dev/null | grep -q "^class htb $LAN_HANDLE:10 " || return 1
+	! tc qdisc show dev "$lan_if" 2>/dev/null | grep -q "^qdisc fq_codel 10: parent $LAN_HANDLE:10 " || return 1
 	tc qdisc show dev "$lan_if" 2>/dev/null | grep -q 'qdisc fq_codel 20:' || return 1
-	rpc_other_classes_ok "$wan_if" "$WAN_HANDLE" up "$degraded" || return 1
-	rpc_other_classes_ok "$lan_if" "$LAN_HANDLE" down "$degraded" || return 1
+	rpc_other_classes_ok "$wan_if" "$WAN_HANDLE" up "$degraded" "$forced_up" || return 1
+	rpc_other_classes_ok "$lan_if" "$LAN_HANDLE" down "$degraded" "$forced_down" || return 1
 	rules="$(nft list table inet nano_shaper 2>/dev/null)" || return 1
 	printf '%s\n' "$rules" | grep -Fq 'comment "nano-monitor-owned-v1"' || return 1
-	printf '%s\n' "$rules" | grep -Fq "iifname \"$lan_if\" oifname \"$wan_if\"" || return 1
-	printf '%s\n' "$rules" | grep -Fq "iifname \"$wan_if\" oifname \"$lan_if\"" || return 1
-	printf '%s\n' "$rules" | grep -Fq "meta priority set $WAN_HANDLE:10" || return 1
-	printf '%s\n' "$rules" | grep -Fq "meta priority set $LAN_HANDLE:10" || return 1
+	expected_priority_sorted="$(priority_words_sorted "$expected_priority_ips")" || return 1
+	live_priority_sorted="$(nft_priority_words_sorted nano_shaper)" || return 1
+	[ -n "$expected_priority_sorted" ] && [ "$live_priority_sorted" = "$expected_priority_sorted" ] || return 1
+	printf '%s\n' "$rules" | grep -F "iifname \"$lan_if\" oifname \"$wan_if\"" | grep -Fq "meta priority set $WAN_HANDLE:0 return" || return 1
+	printf '%s\n' "$rules" | grep -F "iifname \"$wan_if\" oifname \"$lan_if\"" | grep -Fq "meta priority set $LAN_HANDLE:0 return" || return 1
+	output_rules="$(nft list chain inet nano_shaper local_output 2>/dev/null)" || return 1
+	printf '%s\n' "$output_rules" | grep -F "oifname \"$wan_if\"" | grep -Fq "meta priority set $WAN_HANDLE:0 return" || return 1
+	printf '%s\n' "$output_rules" | grep -F "oifname \"$lan_if\"" | grep -Fq "meta priority set $LAN_HANDLE:0 return" || return 1
 	for ip in $(uci -q get bwlimit.main.exempt_ip); do
 		printf '%s\n' "$rules" | grep -Fq "$ip" || return 1
 	done
 	account_rules="$(nft list table inet nano_accounting 2>/dev/null)" || return 1
 	printf '%s\n' "$account_rules" | grep -Fq 'comment "nano-monitor-accounting-v1"' || return 1
+	[ "$(nft_priority_words_sorted nano_accounting)" = "$expected_priority_sorted" ] || return 1
 	registry="$($DEVICE_REGISTRY)" || return 1
 	tab="$(printf '\t')"
 	normal_id=101
 	slow_id=$((101 + SLOW_OFFSET))
 	while IFS="$tab" read -r id mac ip name; do
 		[ -z "$id" ] && continue
+		actual_other_count=$((actual_other_count + 1))
 		printf '%s\n' "$account_rules" | grep -F "ip saddr $ip" | grep -Fq "meta priority set $WAN_HANDLE:$normal_id" || return 1
 		printf '%s\n' "$account_rules" | grep -F "ip saddr $ip" | grep -Fq "meta priority set $WAN_HANDLE:$slow_id" || return 1
 		printf '%s\n' "$account_rules" | grep -F "ip daddr $ip" | grep -Fq "meta priority set $LAN_HANDLE:$normal_id" || return 1
@@ -580,15 +746,25 @@ runtime_shaper_ok() {
 	done <<EOF
 $registry
 EOF
+	[ "$actual_other_count" = "$expected_other_count" ] || return 1
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = '0' ] || return 1
 	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = '0' ] || return 1
 	effective_flow_offloading_disabled || return 1
+	for output_rules in "$expected_nft_sha256" "$expected_wan_tc_sha256" "$expected_lan_tc_sha256"; do
+		[ "${#output_rules}" = '64' ] || return 1
+		case "$output_rules" in *[!0-9a-f]*) return 1 ;; esac
+	done
+	[ "$(rpc_nft_topology_fingerprint nano_shaper)" = "$expected_nft_sha256" ] || return 1
+	[ "$(rpc_tc_topology_fingerprint "$wan_if")" = "$expected_wan_tc_sha256" ] || return 1
+	[ "$(rpc_tc_topology_fingerprint "$lan_if")" = "$expected_lan_tc_sha256" ] || return 1
+	rpc_shaper_gates_ok "$lan_if" "$wan_if" || return 1
 }
 
 method_shaper() {
-	local enabled=0 state message total_down=0 total_up=0 other_down=0 other_up=0 degraded=0 effective_down=0 effective_up=0 other_count=0 wan_if verified applied owned value data_ok=1 snapshot line priority_ips ip applied_at verification_scope generation_before generation_after
+	local enabled=0 state message total_down=0 total_up=0 other_down=0 other_up=0 degraded=0 effective_down=0 effective_up=0 other_count=0 wan_if lan_if verified applied owned value data_ok=1 snapshot line priority_ips ip applied_at verification_scope nft_topology_sha256 wan_tc_topology_sha256 lan_tc_topology_sha256 generation_before generation_after generation_live
 	config_load bwlimit
 	config_get_bool enabled main enabled 0
+	config_get lan_if main lan_if 'br-lan'
 	generation_before="$(cat "$SHAPER_STATE_DIR/generation" 2>/dev/null)"
 	state="$(cat "$SHAPER_STATE_DIR/state" 2>/dev/null)"
 	message="$(cat "$SHAPER_STATE_DIR/message" 2>/dev/null)"
@@ -609,6 +785,9 @@ method_shaper() {
 			other_up_kbit=*) other_up="${line#*=}"; effective_up="$other_up" ;;
 			degraded_kbit=*) degraded="${line#*=}" ;;
 			other_count=*) other_count="${line#*=}" ;;
+			nft_topology_sha256=*) nft_topology_sha256="${line#*=}" ;;
+			wan_tc_topology_sha256=*) wan_tc_topology_sha256="${line#*=}" ;;
+			lan_tc_topology_sha256=*) lan_tc_topology_sha256="${line#*=}" ;;
 			priority_ip=*) ip="${line#*=}"; priority_ips="${priority_ips}${priority_ips:+ }$ip" ;;
 		esac
 	done <<EOF
@@ -622,8 +801,16 @@ EOF
 	is_uint "$applied_at" || data_ok=0
 	verified='0'
 	applied='0'
-	if [ "$enabled" = '1' ] && [ "$owned" = 'active' ] && [ "$data_ok" = '1' ]; then
-		applied='1'
+	if [ "$enabled" = '1' ] && [ "$owned" = 'active' ] && [ "$data_ok" = '1' ] && runtime_shaper_ok "$wan_if" "$total_down" "$total_up" "$other_down" "$other_up" "$degraded" "$other_count" "$priority_ips" "$nft_topology_sha256" "$wan_tc_topology_sha256" "$lan_tc_topology_sha256"; then
+		rpc_shaper_gates_ok "$lan_if" "$wan_if" || data_ok=0
+		generation_live="$(cat "$SHAPER_STATE_DIR/generation" 2>/dev/null)"
+		if [ "$data_ok" = '1' ] && [ "$generation_live" = "$generation_before" ] && is_uint "$generation_live" && [ $((generation_live % 2)) -eq 0 ]; then
+			verified='1'
+			applied='1'
+			[ "$state" = 'active' ] && verification_scope='live_readback'
+		else
+			message='El estado cambió durante el readback en vivo; vuelve a consultar.'
+		fi
 	else
 		case "$state" in active|safe) message='El último readback verificado del servicio no está disponible.' ;; esac
 	fi
@@ -678,6 +865,12 @@ acquire_mutation_lock() {
 		attempt=$((attempt + 1))
 		sleep 1
 	done
+}
+
+transition_gates_absent() {
+	! nft list table inet nano_release_gate >/dev/null 2>&1 &&
+		! nft list table inet nano_accounting_reset_gate >/dev/null 2>&1 &&
+		! nft list table inet nano_shaper_gate >/dev/null 2>&1
 }
 
 device_section_options_known() {
@@ -836,7 +1029,9 @@ method_set_device_policy() {
 	for value in "$requested_bonus" "$requested_down" "$requested_up"; do
 		is_uint "$value" || { json_error 'MB y velocidades deben ser números enteros.'; return 1; }
 	done
+	transition_gates_absent || { json_error 'Hay una transición de red en curso; no se modificó la política.'; return 1; }
 	acquire_mutation_lock || { json_error 'No se pudo bloquear la configuración.'; return 1; }
+	transition_gates_absent || { json_error 'Hay una transición de red en curso; no se modificó la política.'; return 1; }
 	if [ -e "$MIGRATION_FILE" ] || [ -L "$MIGRATION_FILE" ]; then
 		json_error 'La migración preventiva debe completar su reset diario antes de ajustar un dispositivo.'
 		return 1
@@ -912,7 +1107,9 @@ method_set_quota() {
 		return 1
 	fi
 	requested="$(uint_mul "$requested" 1000000)"
+	transition_gates_absent || { json_error 'Hay una transición de red en curso; no se modificó la cuota.'; return 1; }
 	acquire_mutation_lock || { json_error 'No se pudo bloquear la configuración.'; return 1; }
+	transition_gates_absent || { json_error 'Hay una transición de red en curso; no se modificó la cuota.'; return 1; }
 	old="$(uci -q get bwlimit.main.quota_per_device_bytes)"
 	is_uint "$old" || old='700000000'
 	if ! uci -q set bwlimit.main.quota_per_device_bytes="$requested" ||
