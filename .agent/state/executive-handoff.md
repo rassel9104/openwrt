@@ -36,7 +36,7 @@ last_updated: 2026-08-27
 - Uplink `provider`→`pppoe-provider`, radio 167/HT20 y flow offloading desactivado permanecen preservados.
 - Pasaron sintaxis shell/JavaScript, `git diff --check`, build OpenWrt, pruebas enfocadas, readback live y revisión independiente.
 - Rollback r16 y backups live permanecen fuera de Git; `recovery-kit/` continúa local y excluido.
-- Commit funcional de cierre `88dfaaca62e5f0a9d340c5813b0625bfe501a187` publicado y verificado en `fork/nano-m5-upper-5ghz` con autoría RaykTo.
+- Commit funcional de cierre `88dfaaca62e5f0a9d340c5813b0625bfe501a187` publicado y verificado en `fork/nano-m5-upper-5ghz`; `Makefile` y `AUTHORS` identifican explícitamente a RaykTo como owner/maintainer.
 
 ## Open decision / acceptance boundary
 - Cerrada: recuperación técnica, conectividad del PC, presentación r21 y publicación remota confirmadas.
