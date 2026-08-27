@@ -52,7 +52,7 @@ reconcile() {
 		printf 'pid=%s\n' "$$" > /var/run/nano-accounting/handoff || { rc=1; break; }
 		/etc/init.d/nano-accounting stop 9>&- >/dev/null 2>&1 && /etc/init.d/nano-accounting start 9>&- >/dev/null 2>&1 || { rc=1; break; }
 		attempt=0
-		while [ "$attempt" -lt 10 ] && [ "$(cat /var/run/nano-accounting/state 2>/dev/null)" != 'active' ]; do
+		while [ "$attempt" -lt 15 ] && [ "$(cat /var/run/nano-accounting/state 2>/dev/null)" != 'active' ]; do
 			attempt=$((attempt + 1))
 			sleep 1
 		done

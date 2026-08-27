@@ -200,7 +200,7 @@ function renderAccounting(response) {
 					E('i', { 'class': degraded ? 'is-blocked' : '', 'style': 'width:' + deviceProgress.toFixed(1) + '%' })),
 				E('small', {}, formatBytes(deviceUsed) + ' de ' + formatBytes(deviceLimit) + ' · quedan ' + formatBytes(Number(device.remaining)) + (deviceBonus ? ' · compensación: +' + formatBytes(deviceBonus) + ' hoy' : '')),
 				E('div', { 'class': 'nm-device-policy' }, [
-					E('label', {}, [ 'MB extra hoy', E('input', { 'id': 'nm-bonus-' + device.id, 'type': 'number', 'min': '0', 'max': String(maxBonusMb), 'step': '100', 'inputmode': 'numeric', 'value': String(Math.round(deviceBonus / 1000000)) }) ]),
+					E('label', {}, [ 'MB extra hoy', E('input', { 'id': 'nm-bonus-' + device.id, 'type': 'number', 'min': '0', 'max': String(maxBonusMb), 'step': '1', 'inputmode': 'numeric', 'value': String(Math.round(deviceBonus / 1000000)) }) ]),
 					E('label', {}, [ 'Descarga Kbit/s', E('input', { 'id': 'nm-down-' + device.id, 'type': 'number', 'min': String(response.degraded_kbit || 64), 'max': String(response.max_down_kbit || 8800), 'step': '64', 'inputmode': 'numeric', 'value': String(down) }) ]),
 					E('label', {}, [ 'Subida Kbit/s', E('input', { 'id': 'nm-up-' + device.id, 'type': 'number', 'min': String(response.degraded_kbit || 64), 'max': String(response.max_up_kbit || 4200), 'step': '64', 'inputmode': 'numeric', 'value': String(up) }) ]),
 					E('div', { 'class': 'nm-device-actions' }, [

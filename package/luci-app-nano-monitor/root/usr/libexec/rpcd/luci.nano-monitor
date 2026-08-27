@@ -324,11 +324,22 @@ runtime_accounting_live_counters() {
 
 wait_accounting_quota() {
 	local expected="$1" attempt=0 topology
-	while [ "$attempt" -lt 5 ]; do
+	while [ "$attempt" -lt 15 ]; do
 		topology="$(sed -n 's/^topology_sha256=//p' "$ACCOUNT_SNAPSHOT" 2>/dev/null | sed -n '1p')"
 		runtime_accounting_ok "$expected" "$topology" && return 0
 		attempt=$((attempt + 1))
-		sleep 1
+		[ "$attempt" -ge 15 ] || sleep 1
+	done
+	return 1
+}
+
+reconcile_accounting_quota() {
+	local expected="$1" attempt=0
+	while [ "$attempt" -lt 2 ]; do
+		if "$RECONCILE" reconcile 6>&- >/dev/null 2>&1 && wait_accounting_quota "$expected"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
 	done
 	return 1
 }
@@ -338,8 +349,7 @@ restore_quota_value() {
 	uci -q set bwlimit.main.quota_per_device_bytes="$value" || return 1
 	uci -q commit bwlimit || return 1
 	[ "$(uci -q get bwlimit.main.quota_per_device_bytes)" = "$value" ] || return 1
-	"$RECONCILE" reconcile 6>&- >/dev/null 2>&1 || return 1
-	wait_accounting_quota "$value"
+	reconcile_accounting_quota "$value"
 }
 
 method_accounting() {
@@ -1001,17 +1011,28 @@ EOF
 
 wait_device_policy() {
 	local attempt=0
-	while [ "$attempt" -lt 5 ]; do
+	while [ "$attempt" -lt 15 ]; do
 		runtime_device_policy_ok "$@" && return 0
 		attempt=$((attempt + 1))
-		sleep 1
+		[ "$attempt" -ge 15 ] || sleep 1
+	done
+	return 1
+}
+
+reconcile_device_policy() {
+	local attempt=0
+	while [ "$attempt" -lt 2 ]; do
+		if "$RECONCILE" reconcile 6>&- >/dev/null 2>&1 && wait_device_policy "$@"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
 	done
 	return 1
 }
 
 method_set_device_policy() {
 	local input keys key requested_id requested_bonus requested_down requested_up section period_day
-	local base_quota base_down base_up total_down total_up degraded bonus_bytes expected_limit old_limit old_bonus old_down old_up rc migration_hold generation_before generation_after
+	local base_quota base_down base_up total_down total_up degraded bonus_bytes expected_limit old_limit old_bonus old_down old_up migration_hold generation_before generation_after
 	input="$(cat)"
 	json_load "$input" 2>/dev/null || { json_error 'Solicitud JSON no válida.'; return 1; }
 	json_get_keys keys
@@ -1068,10 +1089,8 @@ method_set_device_policy() {
 		json_error 'No se pudo guardar el ajuste individual.'
 		return 1
 	fi
-	"$RECONCILE" reconcile 6>&- >/dev/null 2>&1
-	rc=$?
-	if [ "$rc" -ne 0 ] || ! wait_device_policy "$requested_id" "$expected_limit" "$bonus_bytes" "$requested_down" "$requested_up"; then
-		if restore_device_section "$section" && "$RECONCILE" reconcile 6>&- >/dev/null 2>&1 && wait_device_policy "$requested_id" "$old_limit" "$old_bonus" "$old_down" "$old_up"; then
+	if ! reconcile_device_policy "$requested_id" "$expected_limit" "$bonus_bytes" "$requested_down" "$requested_up"; then
+		if restore_device_section "$section" && reconcile_device_policy "$requested_id" "$old_limit" "$old_bonus" "$old_down" "$old_up"; then
 			json_error 'No se pudo verificar el ajuste; se restauraron y verificaron los valores anteriores.'
 		else
 			json_error 'No se pudo verificar el ajuste ni su restauración; revise contabilidad y shaping.'
@@ -1082,7 +1101,7 @@ method_set_device_policy() {
 }
 
 method_set_quota() {
-	local input keys key requested old rc
+	local input keys key requested old
 	input="$(cat)"
 	json_load "$input" 2>/dev/null || {
 		json_error 'Solicitud JSON no válida.'
@@ -1122,9 +1141,7 @@ method_set_quota() {
 		fi
 		return 1
 	fi
-	"$RECONCILE" reconcile 6>&- >/dev/null 2>&1
-	rc=$?
-	if [ "$rc" -ne 0 ] || ! wait_accounting_quota "$requested"; then
+	if ! reconcile_accounting_quota "$requested"; then
 		if restore_quota_value "$old"; then
 			json_error 'No se pudo verificar la cuota; se verificó la restauración del valor anterior.'
 		else
