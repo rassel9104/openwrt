@@ -563,17 +563,36 @@ topology_fingerprint() {
 	local rules
 	# nft's textual readback is stable on the target. Only object counters and
 	# quota consumption are mutable; every other token defines owned topology.
+	# nft renders exact binary multiples as kbytes/mbytes/gbytes even when the
+	# rule was installed in bytes. Canonicalize those units back to bytes before
+	# comparing with the byte-based expected topology.
 	rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
 	printf '%s\n' "$rules" |
-		awk '{
+		awk '
+		function size_unit(unit) {
+			return unit == "bytes" || unit == "kbytes" || unit == "mbytes" || unit == "gbytes"
+		}
+		function size_bytes(value, unit, factor) {
+			factor = 1
+			if (unit == "kbytes") factor = 1024
+			else if (unit == "mbytes") factor = 1024 * 1024
+			else if (unit == "gbytes") factor = 1024 * 1024 * 1024
+			return value * factor
+		}
+		{
 			if ($0 ~ /^[[:space:]]*quota[[:space:]]+q_[^[:space:]]+[[:space:]]+\{$/)
 				in_quota = 1
 			gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>")
-			# nft omits "used 0 bytes" but prints it after consumption. Remove
-			# that optional suffix only from a quota value line; every other
-			# occurrence remains part of the owned topology fingerprint.
-			if (in_quota && $0 ~ /^[[:space:]]*[0-9]+ bytes used [0-9]+ bytes[[:space:]]*$/)
-				sub(/ used [0-9]+ bytes[[:space:]]*$/, "")
+			# nft omits a zero "used" suffix and may render either value in a
+			# binary unit. Ignore consumption and normalize only a complete quota
+			# value line; unknown tokens remain visible to the fingerprint.
+			if (in_quota && $1 ~ /^[0-9]+$/ && size_unit($2) &&
+				(NF == 2 || (NF == 5 && $3 == "used" && $4 ~ /^[0-9]+$/ && size_unit($5)))) {
+				indent = $0
+				sub(/[0-9].*$/, "", indent)
+				printf "%s%.0f bytes\n", indent, size_bytes($1, $2)
+				next
+			}
 			print
 			if (in_quota && $0 ~ /^[[:space:]]*\}[[:space:]]*$/)
 				in_quota = 0

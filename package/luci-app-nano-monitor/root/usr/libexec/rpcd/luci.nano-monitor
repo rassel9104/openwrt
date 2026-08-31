@@ -187,12 +187,28 @@ rpc_nft_topology_fingerprint() {
 	local table="$1" rules
 	rules="$(nft list table inet "$table" 2>/dev/null)" || return 1
 	printf '%s\n' "$rules" |
-		awk '{
+		awk '
+		function size_unit(unit) {
+			return unit == "bytes" || unit == "kbytes" || unit == "mbytes" || unit == "gbytes"
+		}
+		function size_bytes(value, unit, factor) {
+			factor = 1
+			if (unit == "kbytes") factor = 1024
+			else if (unit == "mbytes") factor = 1024 * 1024
+			else if (unit == "gbytes") factor = 1024 * 1024 * 1024
+			return value * factor
+		}
+		{
 			if ($0 ~ /^[[:space:]]*quota[[:space:]]+q_[^[:space:]]+[[:space:]]+\{$/)
 				in_quota = 1
 			gsub(/packets [0-9]+ bytes [0-9]+/, "packets <runtime> bytes <runtime>")
-			if (in_quota && $0 ~ /^[[:space:]]*[0-9]+ bytes used [0-9]+ bytes[[:space:]]*$/)
-				sub(/ used [0-9]+ bytes[[:space:]]*$/, "")
+			if (in_quota && $1 ~ /^[0-9]+$/ && size_unit($2) &&
+				(NF == 2 || (NF == 5 && $3 == "used" && $4 ~ /^[0-9]+$/ && size_unit($5)))) {
+				indent = $0
+				sub(/[0-9].*$/, "", indent)
+				printf "%s%.0f bytes\n", indent, size_bytes($1, $2)
+				next
+			}
 			print
 			if (in_quota && $0 ~ /^[[:space:]]*\}[[:space:]]*$/)
 				in_quota = 0
